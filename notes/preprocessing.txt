@@ -1,0 +1,94 @@
+This is the steps to implement (made with the help of gemini but main idea is mine so it should be trustable)
+
+
+1. Data Ingestion & Cleaning
+
+    Goal: 
+        Prepare the light curve.
+
+    Function: 
+        load_and_clean(target_name)
+
+    Logic:
+        Download data (Lightkurve).
+        Stitch quarters together.
+        Add: remove_outliers(sigma=5) (Crucial to remove cosmic rays before training).
+        Add: flatten(window_length) (Remove stellar variability).
+        Add: Normalize flux (Mean=0, Std=1) for the Neural Network.
+
+2. The Main "Search Loop" (The Manager)
+
+    Goal: 
+        The high-level logic that orchestrates the "Find → Subtract → Repeat" cycle.
+
+    Function: 
+        run_search(max_planets=5, snr_threshold=10)
+
+    Structure:
+        Create a copy of the flux called residual_flux.
+        Start a Loop (0 to max_planets).
+        Call find_strongest_signal(residual_flux).
+        Check if signal.snr < snr_threshold. If yes, BREAK loop.
+        Add: Call make_box_model() to recreate the shape of the detected signal.
+        Add: Call subtract_signal() to update residual_flux.
+        Add: Call generate_cnn_views() to prep data for your AI.
+        Store the candidate and the views in a list.
+
+3. The Signal Detector (The Physics)
+
+    Goal: 
+        Find the periodic signal in the current data.
+
+    Function: 
+        find_strongest_signal(flux_data)
+
+    Logic:
+        Run BoxLeastSquares (BLS) on the input flux_data.
+        Identify the peak Period, T0 (transit time), Duration, and Depth.
+        Compute SNR (Peak Power / Median Power).
+
+    Return: 
+        A dictionary/object with {Period, T0, Duration, Depth, SNR}.
+
+4. The Subtraction Engine (The "Peeling")
+
+    Goal: 
+        Remove the found planet so the next iteration can find the next one.
+    
+    Function: 
+        make_box_model(time_array, period, t0, duration, depth)
+
+    Logic:
+        Create an array of zeros matching the length of time_array.
+        Calculate phase: (time - t0 + 0.5*P) % P - 0.5*P.
+        Identify indices where abs(phase) < (duration / 2).
+        Set those indices to -depth (if flux is 0-centered) or 1 - depth (if flux is 1-centered).
+    
+    Return: 
+        The model array.
+
+    Function: 
+        subtract_signal(current_flux, model_flux)
+
+    Logic:
+        Simple math: new_flux = current_flux - model_flux.
+
+    Return:
+        The updated new_flux.
+
+5. The CNN Preprocessor (The Translator)
+
+    Goal: 
+        Convert the candidate into the specific format AstroNet needs.
+
+    Function: 
+        generate_cnn_views(flux, period, t0, duration)
+
+    Logic:
+
+        Phase Fold: Fold the original flux (not the residual!) using the period and t0.
+        View 1 (Global): Bin the entire folded curve into X bins (e.g., 2001). This shows the model the full orbit.
+        View 2 (Local): Crop the folded curve to just the transit event (e.g., 4 x duration). Bin this cropped section into Y bins (e.g., 201). This shows the model the U-shape.
+
+    Return: 
+        (global_view, local_view).
