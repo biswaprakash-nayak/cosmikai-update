@@ -1,0 +1,224 @@
+EXOPLANET DETECTION SOFTWARE ROADMAP (MULTI-PLANET + ML)
+
+Goal:
+- Automatic detection of exoplanet transits, including stars with MULTIPLE planets.
+- Best practical approach: BLS proposes candidate periods -> ML model scores candidates -> remove best transit -> repeat.
+
+------------------------------------------------------------
+PART 0 — Project Layout (clean structure)
+Create these files/modules:
+
+exodetect/
+  data_ingestion.py          # you have (download + basic clean)
+  processing.py              # you have (BLS best + fold_to_bins)
+  model.py                   # you have (SmallCNN)
+
+  candidates.py              # NEW: Top-K BLS candidates + features
+  labeling.py                # NEW: transit injection + candidate labeling
+  dataset.py                 # NEW: build (X,y) training samples
+  train.py                   # NEW: training loop + checkpoints
+  evaluate.py                # NEW: metrics + sanity plots
+  inference.py               # NEW: iterative multi-planet detection
+  config.py                  # NEW: all constants/settings
+
+------------------------------------------------------------
+PART 1 — Data Ingestion + Preprocessing (input -> clean arrays)
+Goal:
+- For a given target star, return:
+  time: np.ndarray float32
+  flux: np.ndarray float32 (normalized + flattened)
+
+Implement:
+- get_time_flux(target_name, mission, author=None) -> (time, flux)
+
+Inside should do:
+- download light curve (your existing code)
+- remove NaNs
+- remove outliers (sigma clip)
+- normalize flux (~1.0 baseline)
+- flatten/detrend (remove long-term trends)
+- return time, flux as float32 numpy arrays
+
+Debug checks (print once):
+- length of arrays
+- NaN count
+- median(flux), std(flux)
+
+------------------------------------------------------------
+PART 2 — Candidate Generation (BLS Top-K instead of only best)
+Goal:
+- Produce multiple BLS candidates so the ML model can score them.
+
+Create candidates.py with:
+1) bls_topk(time, flux, k=15, period_range, duration_grid, dedupe) -> list[candidate]
+   Candidate dict should include:
+   - period, duration, t0, depth, power
+
+2) De-duplicate periods:
+- BLS often returns near-identical periods; keep only unique-ish ones.
+
+3) make_candidate_features(time, flux, candidate, nbins)
+- calls fold_to_bins() from processing.py
+- returns a 1D feature vector x of shape (nbins,)
+
+Outputs:
+- candidates: list of dicts
+- X: numpy array shape (k, nbins)
+
+------------------------------------------------------------
+PART 3 — Decide What the Model Predicts (commit to this)
+Recommended: Candidate Classifier (easiest + multi-planet works naturally)
+Model answers:
+- “Given a folded candidate from BLS, is it planet-like?”
+
+Input:
+- folded/binned 1D vector (e.g., nbins = 512)
+
+Output:
+- probability (planet-like) or logit (for BCEWithLogitsLoss)
+
+DO NOT start with a “star-level model predicts N planets” approach.
+It’s harder and still doesn’t give you periods.
+
+------------------------------------------------------------
+PART 4 — Labels + Training Data (how you get supervised learning)
+Best: Transit Injection Dataset (fast + scalable + supports multi-planet)
+Create labeling.py with:
+
+1) sample_injection_params() -> list[injection]
+- Randomly inject 0, 1, 2, or 3 planets per star
+- Each injection dict:
+  - period, t0, duration, depth
+
+2) inject_transits(time, flux, injections) -> new_flux
+- Multiply flux by (1 - depth) during in-transit windows
+
+3) label_candidates(candidates, injections, tol=0.01) -> y list aligned with candidates
+- If candidate period matches ANY injected period within tolerance -> y=1 else y=0
+
+This is what teaches the system multi-planet behavior.
+
+------------------------------------------------------------
+PART 5 — Dataset Builder (stars -> (X, y) samples)
+Create dataset.py
+
+Goal:
+- Turn many stars into a big list of candidate samples:
+  - x: folded candidate vector (nbins,)
+  - y: 0/1 label
+
+Implement:
+1) build_samples_for_star(target_name)
+- get_time_flux()
+- inject 0-3 planets
+- run bls_topk()
+- fold_to_bins for each candidate -> X
+- label candidates -> y
+- return X, y
+
+2) CandidateDataset (PyTorch Dataset)
+- stores list of (x,y)
+- __len__, __getitem__
+
+Critical: caching
+- downloading every epoch is too slow
+- cache either:
+  - processed (time, flux) per target
+  OR
+  - final (X, y) per target
+- simplest: save .npz files in a cache folder
+
+------------------------------------------------------------
+PART 6 — Model (you already have it; keep it swappable)
+In model.py:
+- keep SmallCNN
+- add build_model(nbins) to return model instance
+
+Train with:
+- BCEWithLogitsLoss (logits output)
+- Later you can swap architecture without changing training/inference code
+
+Optional later upgrade (not first):
+- “two-view” input: global folded + local zoom near transit
+
+------------------------------------------------------------
+PART 7 — Training Loop (train.py)
+Create train.py
+
+Must include:
+1) Load dataset and split train/val
+2) DataLoaders
+3) Train and eval loops:
+- train_one_epoch(model, loader, optimizer, loss_fn)
+- eval_one_epoch(model, loader, loss_fn)
+
+Use:
+- Adam optimizer
+- BCEWithLogitsLoss
+- Save best checkpoint
+
+Metrics to track:
+- precision, recall (more important than accuracy)
+- optionally ROC-AUC or PR-AUC (good for class imbalance)
+
+Handle imbalance:
+- negatives will dominate
+- consider pos_weight in loss or balanced sampling
+
+------------------------------------------------------------
+PART 8 — Multi-Planet Inference (inference.py)
+This is your “automatic detector”.
+
+Goal:
+Given time, flux:
+1) Run BLS Top-K on current residual flux
+2) Fold each candidate -> X
+3) Score with model -> probs
+4) If best prob >= threshold:
+   - accept detection
+   - remove/mask that transit
+   - repeat
+5) Stop when no candidate passes threshold or max_planets reached
+
+Implement:
+- score_candidates(model, X) -> probs
+- remove_transit() OR mask_transit() (start with masking)
+
+Output:
+- list of detections:
+  [
+    {"period":..., "t0":..., "duration":..., "depth":..., "prob":...},
+    ...
+  ]
+
+------------------------------------------------------------
+PART 9 — Evaluation + Sanity Tests (evaluate.py)
+Create evaluate.py
+
+Must include:
+- injection test:
+  - inject 2-3 planets
+  - run inference loop
+  - check detected periods ~ injected periods
+
+Plots:
+- BLS periodogram
+- folded curve for each accepted detection
+- before/after masking (residual flux) if helpful
+
+------------------------------------------------------------
+RECOMMENDED IMPLEMENTATION ORDER (so it actually works)
+1) Part 1: get_time_flux() stable and clean
+2) Part 2: bls_topk() returns sensible candidates
+3) Part 4: injection + labeling works for ONE star
+4) Part 5: dataset builds (X,y) correctly
+5) Part 7: training runs, loss decreases
+6) Part 8: inference finds >=1 planet on injection tests
+7) Verify multi-planet: inference finds 2-3 injected planets via iterative removal
+8) Then tune model/architecture + thresholds
+
+------------------------------------------------------------
+NOTES
+- The ML model is best used as a “vetter” of BLS candidates.
+- Multi-planet detection comes from repeating: detect -> remove -> detect again.
+- Data quality + labeling strategy matters more than CNN vs transformer early on.
