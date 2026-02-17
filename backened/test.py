@@ -1,7 +1,7 @@
 from data_ingestion import get_time_flux
 import numpy as np
 
-t, f = get_time_flux("Pi Mensae", "TESS")
+t, f = get_time_flux("Pi Mensae", "TESS", author="SPOC", download_all=False)
 print("N =", len(t))
 print("time range:", float(t.min()), "to", float(t.max()))
 print("flux median/std:", float(np.median(f)), float(np.std(f)))
