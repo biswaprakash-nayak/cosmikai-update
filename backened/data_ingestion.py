@@ -1,8 +1,8 @@
 # This modules data downloading and basic data processing to clean up the lightcurve data
 
-# last updated: 17-feb-2026
+# last updated: 18-feb-2026
 # updated by: Arpon Deb
-# changes made: edits to all functions due to errors in process_lightcurve_data()
+# changes made: edits to process_lightcurve_data and get_time_flux to fix data_ingestion.py
 
 import numpy as np
 import lightkurve as lk
@@ -23,12 +23,20 @@ def download_lightcurve_data(target_name: str, mission: str, author: str | None 
     return search_result.download_all() if download_all else search_result.download()
 
 
-def process_lightcurve_data(lightcurves, sigma: float = 5.0):
-    # Avoid normalize() here because some products are zero-centered (ppm)
-    lc = lightcurves.stitch().remove_nans()
+def process_lightcurve_data(lightcurves, sigma: float = 5.0, flatten_window_length: int | None = None):
+    # If it's a collection, stitch it. If it's already a single LightCurve, use it directly.
+    lc = lightcurves.stitch() if hasattr(lightcurves, "stitch") else lightcurves
+
+    lc = lc.remove_nans()
     lc = lc.remove_outliers(sigma=sigma)
-    lc = lc.flatten()
+
+    if flatten_window_length is None:
+        lc = lc.flatten()
+    else:
+        lc = lc.flatten(window_length=flatten_window_length)
+
     return lc
+
 
 
 def get_time_flux(target_name: str, mission: str, author: str = "None",
@@ -38,15 +46,15 @@ def get_time_flux(target_name: str, mission: str, author: str = "None",
 
     time = lc.time.value.astype(np.float32)
 
-    # Convert flux safely
-    if hasattr(lc.flux, "unit") and lc.flux.unit == u.ppm:
-        # ppm is usually zero-centered: convert to relative flux around 1
+    unit_str = str(getattr(lc.flux, "unit", "")).lower()
+    if "ppm" in unit_str:
         flux = (1.0 + lc.flux.value.astype(np.float32) / 1e6)
     else:
         flux = lc.flux.value.astype(np.float32)
         med = np.nanmedian(flux)
         if np.isfinite(med) and med != 0:
-            flux = flux / med  # baseline ~1
+            flux = flux / med
+
 
     # Final cleanup
     m = np.isfinite(time) & np.isfinite(flux)
