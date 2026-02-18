@@ -1,4 +1,4 @@
-from data_ingestion import get_time_flux
+from backened.data_ingestion_backup import get_time_flux
 import numpy as np
 
 t, f = get_time_flux("Pi Mensae", "TESS", author="SPOC", download_all=False)
