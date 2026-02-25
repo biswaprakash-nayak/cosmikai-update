@@ -65,8 +65,9 @@ def process_lightcurve_data(lightcurves, sigma: float = 5.0, flatten_window_leng
     else:
         processed_lightcurves = processed_lightcurves.flatten(window_length=flatten_window_length)
 
-    # don't delete for now
-#    processed_lightcurves = processed_lightcurves.normalize()
+    # don't delete for now, might be broken
+    # should normalize it
+    processed_lightcurves = processed_lightcurves.normalize()
 
     return processed_lightcurves
 
