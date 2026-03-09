@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 225 6% 4%;
+    --foreground: 220 5% 90%;
+
+    --card: 225 6% 8%;
+    --card-foreground: 220 5% 90%;
+
+    --popover: 225 6% 8%;
+    --popover-foreground: 220 5% 90%;
+
+    --primary: 220 5% 85%;
+    --primary-foreground: 225 6% 4%;
+
+    --secondary: 225 6% 12%;
+    --secondary-foreground: 220 5% 90%;
+
+    --muted: 225 6% 10%;
+    --muted-foreground: 220 5% 55%;
+
+    --accent: 225 6% 14%;
+    --accent-foreground: 220 5% 90%;
+
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 0 0% 98%;
+
+    --success: 142 50% 45%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 0%;
+
+    --border: 225 6% 16%;
+    --input: 225 6% 14%;
+    --ring: 220 5% 50%;
+
+    --radius: 0.375rem;
+
+    --sidebar-background: 225 6% 5%;
+    --sidebar-foreground: 220 5% 90%;
+    --sidebar-primary: 220 5% 85%;
+    --sidebar-primary-foreground: 225 6% 4%;
+    --sidebar-accent: 225 6% 12%;
+    --sidebar-accent-foreground: 220 5% 90%;
+    --sidebar-border: 225 6% 16%;
+    --sidebar-ring: 220 5% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', sans-serif;
+  }
+}
+
+@layer utilities {
+  .font-data {
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .panel {
+    @apply bg-card border border-border rounded-md;
+  }
+  .panel-dark {
+    @apply bg-background border border-border rounded-md;
+  }
+}
