@@ -1,0 +1,52 @@
+{
+  "model_name": "TransitCNN",
+  "version": "1.0.0",
+  "description": "1D Convolutional Neural Network for exoplanet transit detection. Trained on phase-folded, BLS-preprocessed Kepler light curves.",
+  "architecture": {
+    "type": "1D-CNN",
+    "input_length": 512,
+    "conv_blocks": 3,
+    "channels": [32, 64, 128],
+    "kernel_sizes": [7, 7, 5],
+    "pooling": "MaxPool1d(2) after blocks 1-2, AdaptiveAvgPool1d(1) after block 3",
+    "classifier": "Linear(128→128) → ReLU → Dropout(0.3) → Linear(128→1)",
+    "output": "raw logit (apply sigmoid for probability)"
+  },
+  "num_parameters": 88961,
+  "model_size_kb": 288,
+  "training": {
+    "dataset": "Kepler DR25 confirmed planets + false positives",
+    "training_stars": 1919,
+    "positive_class": "confirmed planet",
+    "negative_class": "false positive / background eclipsing binary",
+    "train_split": 0.80,
+    "val_split": 0.10,
+    "test_split": 0.10
+  },
+  "preprocessing": {
+    "bls_period_min_days": 0.6,
+    "bls_period_max_days": 12.0,
+    "bls_n_periods": 5000,
+    "bls_durations_days": "linspace(0.03, 0.3, 20)",
+    "n_bins": 512,
+    "flatten_window": 301,
+    "flatten_polyorder": 2,
+    "normalization": "median",
+    "standardization": "(x - median) / std"
+  },
+  "performance": {
+    "auprc": 0.9972,
+    "auroc": 0.9948,
+    "accuracy": 0.9724,
+    "precision": 0.9681,
+    "recall": 0.9803,
+    "f1_score": 0.9742,
+    "threshold_at_max_f1": 0.50
+  },
+  "hardware": {
+    "training_device": "NVIDIA GPU",
+    "inference_target": "CPU (satellite edge deployment)",
+    "inference_latency_ms": "<10 on modern CPU"
+  },
+  "notes": "Model is intentionally compact for satellite edge deployment. AUPRC of 99.72% on held-out Kepler validation set."
+}
