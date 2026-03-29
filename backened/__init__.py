@@ -1,1 +1,0 @@
-# CosmiKAI backend package

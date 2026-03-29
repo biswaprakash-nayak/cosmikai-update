@@ -1,21 +1,15 @@
 # CosmiKAI — Python dependencies
 # Install with: pip install -r requirements.txt
 
-# ── Astronomy / data acquisition ───────────────────────────────────────────
-lightkurve        # MAST light curve download (wraps astroquery)
-astropy           # BoxLeastSquares BLS, time handling, units
+# ── Required by main code/ ─────────────────────────────────────────────────
+lightkurve        # Used in data_ingestion.py (MAST light curve download)
+astropy           # Used in preprocessing.py (BoxLeastSquares) and units in data_ingestion.py
+numpy             # Used throughout main code/
+torch             # Used in model_inference.py
 
-# ── Machine learning ────────────────────────────────────────────────────────
-torch             # TransitCNN 1D-CNN inference (CPU build sufficient for server)
-numpy             # Array operations throughout the pipeline
-
-# ── Signal processing ───────────────────────────────────────────────────────
-scipy             # savgol_filter used in flatten_flux (preprocess.py)
-
-# ── Backend API server ──────────────────────────────────────────────────────
-fastapi           # REST API framework
-uvicorn[standard] # ASGI server (includes websockets + fast C extensions)
-aiosqlite         # Async SQLite driver used by the prediction cache
-
-# ── Data validation ─────────────────────────────────────────────────────────
-pydantic          # Request/response schema validation (bundled with FastAPI)
+# ── Optional: non-main-code components ─────────────────────────────────────
+scipy             # Used by other project modules, not required by main code/
+fastapi           # Backend API framework
+uvicorn[standard] # ASGI server runtime for backend
+aiosqlite         # Async SQLite driver for backend cache
+pydantic          # Backend schema validation

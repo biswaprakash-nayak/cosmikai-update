@@ -1,1 +1,0 @@
-# CosmiKAI model source package
