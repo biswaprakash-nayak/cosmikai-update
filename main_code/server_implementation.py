@@ -278,7 +278,8 @@ app.add_middleware(
 async def health() -> HealthResponse:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM star_predictions") as cur:
-            total_predictions = int((await cur.fetchone())[0])
+            row = await cur.fetchone()
+            total_predictions = int(row[0]) if row and row[0] is not None else 0
     # returns the health response with model status, uptime, and total predictions made
     return HealthResponse(
         status="ok",
@@ -421,7 +422,8 @@ async def history(
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT COUNT(*) AS n FROM star_predictions") as cur:
-            total = int((await cur.fetchone())["n"])
+            row = await cur.fetchone()
+            total = int(row["n"]) if row and row["n"] is not None else 0
         query = f"SELECT * FROM star_predictions ORDER BY {sort_col} {direction} LIMIT ? OFFSET ?"
         async with db.execute(query, (limit, offset)) as cur:
             rows = [dict(r) for r in await cur.fetchall()]
@@ -453,7 +455,8 @@ async def stats() -> StatsResponse:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT COUNT(*) AS n FROM star_predictions") as cur:
-            total = int((await cur.fetchone())["n"])
+            row = await cur.fetchone()
+            total = int(row["n"]) if row and row["n"] is not None else 0
         if total == 0:
             return StatsResponse(
                 total_analyzed=0,
@@ -464,12 +467,14 @@ async def stats() -> StatsResponse:
                 below_threshold=0,
             )
         async with db.execute("SELECT AVG(best_score) AS avg_score FROM star_predictions") as cur:
-            avg_score = float((await cur.fetchone())["avg_score"] or 0.0)
+            row = await cur.fetchone()
+            avg_score = float(row["avg_score"]) if row and row["avg_score"] is not None else 0.0
         async with db.execute(
             "SELECT COUNT(*) AS n FROM star_predictions WHERE best_score >= ?",
             (DEFAULT_THRESHOLD,),
         ) as cur:
-            above = int((await cur.fetchone())["n"])
+            row = await cur.fetchone()
+            above = int(row["n"]) if row and row["n"] is not None else 0
         async with db.execute(
             "SELECT mission, COUNT(*) AS n FROM star_predictions GROUP BY mission"
         ) as cur:
