@@ -31,7 +31,7 @@ from preprocessing import bls_topk, fold_to_bins
 
 # path to model weights
 DEFAULT_WEIGHTS_PATH = (
-    Path(__file__).resolve().parents[1] / "main code" / "model" / "best_model.pt"
+    Path(__file__).resolve().parent / "model" / "best_model.pt"
 )
 
 # checks the device for cuda availability and returns the appropriate torch device

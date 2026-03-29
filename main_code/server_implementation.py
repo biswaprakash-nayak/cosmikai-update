@@ -16,8 +16,6 @@
 # fastapi for the web server and API handling
 # pydantic for request/response data validation and modeling
 
-#from __future__ import annotations         # can help with older Python versions, uncomment if needed
-
 import asyncio
 import json
 import logging
@@ -25,13 +23,14 @@ import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
 import aiosqlite
 from fastapi import FastAPI, HTTPException
 from fastapi import Query as QueryParam
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# internal imports 
+# internal imports
 from model_inference import DEFAULT_WEIGHTS_PATH, predict_star_transit
 
 # logging setup
@@ -82,7 +81,8 @@ CREATE TABLE IF NOT EXISTS star_predictions (
 
 # input schema for the /predict API endpoint
 class PredictRequest(BaseModel):
-    target_name: str = Field(..., min_length=1)
+    star_name: str | None = Field(default=None)
+    target_name: str | None = Field(default=None)
     mission: str = Field(..., min_length=1)
     author: str = Field(default="None")
     threshold: float = Field(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0)
@@ -91,50 +91,53 @@ class PredictRequest(BaseModel):
 
 # output schema for the /predict API endpoint
 class PredictionResponse(BaseModel):
-    target_name: str
+    star_name: str
     mission: str
-    author: str
-    threshold: float
-    best_score: float
+    score: float
+    percentage: float
+    period_days: float | None
     verdict: str
-    best_candidate: dict
-    num_candidates: int
-    device: str
-    all_scores: list[float]
+    transit_depth_estimate: float | None
+    duration_estimate: float | None
+    num_datapoints: int | None
     cached: bool
     processing_time_seconds: float
     timestamp: str
 
-# schema for a stored prediction 
+# schema for a stored prediction in history
 class HistoryItem(BaseModel):
     id: int
-    target_name: str
+    star_name: str
     mission: str
-    author: str
-    threshold: float
-    k_candidates: int
-    best_score: float
+    score: float
+    percentage: float
+    period_days: float | None
     verdict: str
-    best_candidate: dict
-    num_candidates: int
-    device: str
-    all_scores: list[float]
-    created_at: str
-    updated_at: str
+    num_datapoints: int | None
+    timestamp: str
 
 # response schema for the /history API endpoint
 class HistoryResponse(BaseModel):
     items: list[HistoryItem]
     total: int
-    limit: int
-    offset: int
+
+# response schema for the /stats API endpoint
+class StatsResponse(BaseModel):
+    total_analyzed: int
+    average_score: float
+    detection_rate: float
+    missions: dict[str, int]
+    above_threshold: int
+    below_threshold: int
 
 # response schema for the /health API endpoint
 class HealthResponse(BaseModel):
     status: str
+    model_loaded: bool
+    model_version: str
+    model_auprc: float
+    total_predictions: int
     uptime_seconds: float
-    db_path: str
-    weights_path: str
 
 # initializes the SQLite database and creates the necessary table if it doesn't exist
 async def _init_db() -> None:
@@ -225,9 +228,10 @@ async def _upsert_prediction(payload: dict) -> None:
 # output:
 # a dictionary containing the inference results
 def _run_pipeline_sync(body: PredictRequest) -> dict:
-    # calls the predict_star_transit function from model_inference.py 
+    # this is the main function that runs the entire inference pipeline
+    target_name = (body.target_name or body.star_name or "").strip()
     return predict_star_transit(
-        target_name=body.target_name,
+        target_name=target_name,
         mission=body.mission,
         author=body.author,
         threshold=body.threshold,
@@ -272,12 +276,17 @@ app.add_middleware(
 # defines the /health endpoint to check server status and uptime
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    # just to check if the api is running
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM star_predictions") as cur:
+            total_predictions = int((await cur.fetchone())[0])
+    # returns the health response with model status, uptime, and total predictions made
     return HealthResponse(
         status="ok",
+        model_loaded=Path(DEFAULT_WEIGHTS_PATH).exists(),
+        model_version="main_code_v1",
+        model_auprc=0.0,
+        total_predictions=total_predictions,
         uptime_seconds=round(_time.monotonic() - _state.start_time, 2),
-        db_path=str(DB_PATH),
-        weights_path=str(DEFAULT_WEIGHTS_PATH),
     )
 
 # defines the /predict endpoint to run inference on the target
@@ -287,29 +296,31 @@ async def health() -> HealthResponse:
 # a PredictionResponse object containing the inference results and metadata
 @app.post("/api/predict", response_model=PredictionResponse)
 async def predict(body: PredictRequest) -> PredictionResponse:
-    # edit user inputs (remove whitespace)
-    target_name = body.target_name.strip()
+    target_name = (body.target_name or body.star_name or "").strip()
+    # cleans the input parameters (removes leading/trailing whitespace)
     mission = body.mission.strip()
     # author is optional, set to "None" if none is given
     author = body.author.strip() if body.author else "None"
-    # basic request validation
+    # basic request validation checks if the required parameters are present, if not, raises a 400 error
     if not target_name or not mission:
-        raise HTTPException(status_code=400, detail="target_name and mission are required.")
-    # checks cache if it exists unless force_rerun is True
+        raise HTTPException(status_code=400, detail="star_name and mission are required.")
+    # checks the cache for existing predictions
     if not body.force_rerun:
         cached = await _get_cached_prediction(target_name, mission, author)
         if cached:
+            period_days = float(cached["best_candidate"].get("period")) if cached.get("best_candidate") else None
+            duration_estimate = float(cached["best_candidate"].get("duration")) if cached.get("best_candidate") else None
+            depth = float(cached["best_candidate"].get("depth", 0.0)) if cached.get("best_candidate") else 0.0
             return PredictionResponse(
-                target_name=cached["target_name"],
+                star_name=cached["target_name"],
                 mission=cached["mission"],
-                author=cached["author"],
-                threshold=body.threshold,
-                best_score=cached["best_score"],
+                score=float(cached["best_score"]),
+                percentage=round(float(cached["best_score"]) * 100.0, 2),
+                period_days=period_days,
                 verdict="TRANSIT_DETECTED" if cached["best_score"] >= body.threshold else "NO_TRANSIT",
-                best_candidate=cached["best_candidate"],
-                num_candidates=cached["num_candidates"],
-                device=cached["device"],
-                all_scores=cached["all_scores"],
+                transit_depth_estimate=abs(depth),
+                duration_estimate=duration_estimate,
+                num_datapoints=None,
                 cached=True,
                 processing_time_seconds=0.0,
                 timestamp=cached["updated_at"],
@@ -318,7 +329,7 @@ async def predict(body: PredictRequest) -> PredictionResponse:
     # defines the request and start time
     t0 = _time.monotonic()
     request = PredictRequest(
-        target_name=target_name,
+        star_name=target_name,
         mission=mission,
         author=author,
         threshold=body.threshold,
@@ -362,18 +373,21 @@ async def predict(body: PredictRequest) -> PredictionResponse:
     }
     # adds to the database
     await _upsert_prediction(stored)
-    # return API response for frontend
+    # extracts the period, duration, and depth from the best candidate for the response
+    period_days = float(result["best_candidate"].get("period")) if result.get("best_candidate") else None
+    duration_estimate = float(result["best_candidate"].get("duration")) if result.get("best_candidate") else None
+    depth = float(result["best_candidate"].get("depth", 0.0)) if result.get("best_candidate") else 0.0
+    # returns the final response 
     return PredictionResponse(
-        target_name=result["target_name"],
+        star_name=result["target_name"],
         mission=result["mission"],
-        author=author,
-        threshold=float(body.threshold),
-        best_score=float(result["best_score"]),
+        score=float(result["best_score"]),
+        percentage=round(float(result["best_score"]) * 100.0, 2),
+        period_days=period_days,
         verdict=result["verdict"],
-        best_candidate=result["best_candidate"],
-        num_candidates=int(result["num_candidates"]),
-        device=result["device"],
-        all_scores=[float(s) for s in result["all_scores"]],
+        transit_depth_estimate=abs(depth),
+        duration_estimate=duration_estimate,
+        num_datapoints=None,
         cached=False,
         processing_time_seconds=round(_time.monotonic() - t0, 3),
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -389,26 +403,83 @@ async def predict(body: PredictRequest) -> PredictionResponse:
 async def history(
     limit: int = QueryParam(default=50, ge=1, le=200),
     offset: int = QueryParam(default=0, ge=0),
+    sort: str = QueryParam(default="timestamp"),
+    order: str = QueryParam(default="desc"),
 ) -> HistoryResponse:
-    # list stored predictions
+    # defines allowed sorting options 
+    allowed_sort = {
+        "timestamp": "updated_at",
+        "score": "best_score",
+        "star_name": "target_name",
+        "mission": "mission",
+        "period_days": "updated_at",
+    }
+    # validates the sort and order parameters
+    sort_col = allowed_sort.get(sort, "updated_at")
+    direction = "DESC" if order.lower() == "desc" else "ASC"
+    # queries the database 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT COUNT(*) AS n FROM star_predictions") as cur:
             total = int((await cur.fetchone())["n"])
-        async with db.execute(
-            """
-            SELECT * FROM star_predictions
-            ORDER BY updated_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            (limit, offset),
-        ) as cur:
+        query = f"SELECT * FROM star_predictions ORDER BY {sort_col} {direction} LIMIT ? OFFSET ?"
+        async with db.execute(query, (limit, offset)) as cur:
             rows = [dict(r) for r in await cur.fetchall()]
-    # convert the json to dict and create HistoryItem objects for the response
-    items = []
+    # converts the json output into the HistoryItem format for the response
+    items: list[HistoryItem] = []
     for row in rows:
-        row["best_candidate"] = json.loads(row["best_candidate"])
-        row["all_scores"] = json.loads(row["all_scores"])
-        items.append(HistoryItem(**row))
-    # return the response with the list of history items 
-    return HistoryResponse(items=items, total=total, limit=limit, offset=offset)
+        best_candidate = json.loads(row["best_candidate"])
+        period_days = float(best_candidate.get("period")) if best_candidate else None
+        items.append(
+            HistoryItem(
+                id=int(row["id"]),
+                star_name=row["target_name"],
+                mission=row["mission"],
+                score=float(row["best_score"]),
+                percentage=round(float(row["best_score"]) * 100.0, 2),
+                period_days=period_days,
+                verdict=row["verdict"],
+                num_datapoints=None,
+                timestamp=row["updated_at"],
+            )
+        )
+    # returns the history response
+    return HistoryResponse(items=items, total=total)
+
+# defines the /stats endpoint for dashboard telemetry
+@app.get("/api/stats", response_model=StatsResponse)
+async def stats() -> StatsResponse:
+    # queries the database for the stats
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT COUNT(*) AS n FROM star_predictions") as cur:
+            total = int((await cur.fetchone())["n"])
+        if total == 0:
+            return StatsResponse(
+                total_analyzed=0,
+                average_score=0.0,
+                detection_rate=0.0,
+                missions={},
+                above_threshold=0,
+                below_threshold=0,
+            )
+        async with db.execute("SELECT AVG(best_score) AS avg_score FROM star_predictions") as cur:
+            avg_score = float((await cur.fetchone())["avg_score"] or 0.0)
+        async with db.execute(
+            "SELECT COUNT(*) AS n FROM star_predictions WHERE best_score >= ?",
+            (DEFAULT_THRESHOLD,),
+        ) as cur:
+            above = int((await cur.fetchone())["n"])
+        async with db.execute(
+            "SELECT mission, COUNT(*) AS n FROM star_predictions GROUP BY mission"
+        ) as cur:
+            missions = {row["mission"]: int(row["n"]) for row in await cur.fetchall()}
+    # returns the stats response
+    return StatsResponse(
+        total_analyzed=total,
+        average_score=round(avg_score, 4),
+        detection_rate=round(above / total, 4),
+        missions=missions,
+        above_threshold=above,
+        below_threshold=total - above,
+    )

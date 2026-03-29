@@ -1,0 +1,12 @@
+# CosmiKAI — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Required by main_code/ (inference + API server) ───────────────────────
+numpy             # Array operations across pipeline
+torch             # TransitCNN inference
+lightkurve        # MAST light curve download
+astropy           # BLS + astronomy units
+fastapi           # API framework for server_implementation.py
+uvicorn[standard] # ASGI server process
+aiosqlite         # Async SQLite cache storage
+pydantic          # Request/response validation models
