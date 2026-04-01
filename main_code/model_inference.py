@@ -29,10 +29,61 @@ from candidates import Candidate
 from data_ingestion import get_time_flux
 from preprocessing import bls_topk, fold_to_bins
 
+# this function checks if two periods are related by being harmonics or subharmonics of each other, which helps in filtering out duplicate candidates that are just harmonics of the same signal
+# inputs:
+# p1: the first period to compare
+# p2: the second period to compare
+# rel_tol: the relative tolerance to consider for determining if the periods are related 
+# output:
+# a boolean indicating whether the two periods are related (True) or not (False)
+def _periods_are_related(p1: float, p2: float, rel_tol: float = 0.04) -> bool:
+    # checks if either period is non-positive, which is invalid for periods, and returns False in that case
+    if p1 <= 0 or p2 <= 0:
+        return False
+    # calculates the ratio of the two periods and checks if it is close to an integer value 
+    ratio = max(p1, p2) / min(p1, p2)
+    # gets the absolute value of the difference
+    for n in (1.0, 1.5, 2.0, 2.5, 3.0):
+        if abs(ratio - n) <= rel_tol * n:
+            return True
+    return False
+
 # path to model weights
 DEFAULT_WEIGHTS_PATH = (
     Path(__file__).resolve().parent / "model" / "best_model.pt"
 )
+
+# it helps fix the older models not being compatitble by changing the dictionary to standardize it
+# input:
+# raw_state: the raw state dictionary loaded from the checkpoint
+# output:
+# a normalized state dictionary that can be loaded into the model regardless of the training version
+def _normalize_checkpoint_state_dict(raw_state: dict) -> dict:
+    state = raw_state
+    # some older checkpoints might have the state dict nested under "state_dict" or "model_state_dict", this checks for both
+    if "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    elif "model_state_dict" in state and isinstance(state["model_state_dict"], dict):
+        state = state["model_state_dict"]
+    # this remaps the keys in the dictionary
+    remapped = {}
+    legacy_to_current_prefixes = {
+        "conv.0": "feature_extractor.0",
+        "conv.2": "feature_extractor.3",
+        "conv.4": "feature_extractor.6",
+        "fc.1": "classifier.1",
+        "fc.4": "classifier.4",
+    }
+    # it iterates through the state dictionary and remaps the keys based on the legacy prefixes to the current model architecture prefixes
+    for key, value in state.items():
+        new_key = key
+        for legacy_prefix, current_prefix in legacy_to_current_prefixes.items():
+            if key.startswith(f"{legacy_prefix}."):
+                new_key = key.replace(legacy_prefix, current_prefix, 1)
+                break
+        remapped[new_key] = value
+    # returns the remapped state dictionary that can be loaded into the model
+    return remapped
 
 # checks the device for cuda availability and returns the appropriate torch device
 def resolve_torch_device(preferred_device: str | None = None) -> torch.device:
@@ -98,6 +149,7 @@ def load_trained_model(
     model = TransitCNN()
     # loads the model weights from the specified path to the specified device into a state dictionary
     state_dict = torch.load(Path(weights_path), map_location=resolved_device, weights_only=True)
+    state_dict = _normalize_checkpoint_state_dict(state_dict)
     # loads the state dictionary into the model
     model.load_state_dict(state_dict)
     # moves the model to the resolved device
@@ -116,29 +168,32 @@ def load_trained_model(
 # candidates: a list of Candidate objects that are the output of the BLS algorithm
 # nbins: the number of bins to fold the lightcurve data into (default 512)
 # output:
-# X: a numpy array of shape (N, nbins) where N is the number of candidates 
+# X: a numpy array of shape (N, nbins) where N is the number of candidates
+# folded_curves: list of folded arrays for each candidate (for visualization)
 def build_candidate_matrix(
     time: np.ndarray,
     flux: np.ndarray,
     candidates: list[Candidate],
     nbins: int = 512,
-) -> np.ndarray:
+) -> tuple[np.ndarray, list[np.ndarray]]:
     # checks if there are any candidates, if not raises an error
     if not candidates:
         raise ValueError("No BLS candidates were provided.")
     # for each candidate, it folds the lightcurve data into the bins
     # then it returns a numpy array with all the converted candidates
     rows = []
+    folded_curves = []
     for cand in candidates:
         folded = fold_to_bins(time, flux, cand.period, cand.t0, nbins=nbins)
         rows.append(folded)
+        folded_curves.append(folded)
     # stacks the folded lightcurves into a 2D array and converts to float32 for the model
     X = np.stack(rows, axis=0).astype(np.float32)
     # checks for infnite matrix
     if not np.isfinite(X).all():
         raise ValueError("Candidate matrix contains NaN/Inf after preprocessing.")
-    # returns the final candidate matrix
-    return X
+    # returns the final candidate matrix and list of folded curves
+    return X, folded_curves
 
 # this scores the candidates
 # inputs:
@@ -167,7 +222,8 @@ def score_candidates(model: TransitCNN, X: np.ndarray, device: torch.device) -> 
 # model_weights_path: the path to the model weights 
 # device: the device to run inference on 
 # output:
-# a dictionary with the inference results, including the best candidate and its score, the verdict, and other relevant information
+# a list of dictionaries with inference results for each detected candidate (up to 5),
+# sorted by score descending
 def predict_star_transit(
     target_name: str,
     mission: str,
@@ -176,7 +232,7 @@ def predict_star_transit(
     k_candidates: int = 15,
     model_weights_path: str | Path = DEFAULT_WEIGHTS_PATH,
     device: str | None = None,
-) -> dict:
+) -> list[dict]:
     # loads the model and resolves the device for inference
     model, resolved_device = load_trained_model(model_weights_path, device=device)
     # gets the time and flux arrays for the target star and mission using the data ingestion function
@@ -184,27 +240,86 @@ def predict_star_transit(
         target_name=target_name,
         mission=mission,
         author=author,
-        download_all=False,
+        download_all=True,
     )
     # runs the BLS algorithm to get the top k candidates and builds the candidate matrix for the model
     candidates = bls_topk(time, flux, k=k_candidates)
     # builds the candidate matrix for the model using the previous function
-    X = build_candidate_matrix(time, flux, candidates, nbins=512)
+    X, folded_curves = build_candidate_matrix(time, flux, candidates, nbins=512)
     # scores the candidates using the model and the previous function
     scores = score_candidates(model, X, resolved_device)
-    # finds the best candidate and its score
-    best_idx = int(np.argmax(scores))
-    best_score = float(scores[best_idx])
-    best_candidate = candidates[best_idx]
-    # returns the inference results dict
-    return {
-        "target_name": target_name,
-        "mission": mission,
-        "threshold": float(threshold),
-        "best_score": best_score,
-        "verdict": "TRANSIT_DETECTED" if best_score >= threshold else "NO_TRANSIT",
-        "best_candidate": asdict(best_candidate),
-        "num_candidates": len(candidates),
-        "device": str(resolved_device),
-        "all_scores": [float(s) for s in scores],
-    }
+    
+    # Create list of (index, score) tuples and sort by score descending
+    scored_candidates = list(enumerate(scores))
+    scored_candidates.sort(key=lambda x: x[1], reverse=True)
+    
+    # Filter and keep top detections that pass threshold, with period de-duplication.
+    results = []
+    max_detections = 5
+    additional_min_score = max(float(threshold), 0.70)
+    picked_periods: list[float] = []
+    for idx, score in scored_candidates:
+        candidate = candidates[idx]
+
+        # Always keep the highest-scoring candidate as baseline output.
+        if len(results) == 0:
+            folded = folded_curves[idx]
+            results.append({
+                "target_name": target_name,
+                "mission": mission,
+                "threshold": float(threshold),
+                "best_score": float(score),
+                "verdict": "TRANSIT_DETECTED" if score >= threshold else "NO_TRANSIT",
+                "best_candidate": asdict(candidate),
+                "num_candidates": len(candidates),
+                "device": str(resolved_device),
+                "all_scores": [float(s) for s in scores],
+                "folded_lightcurve": [float(x) for x in folded],
+            })
+            picked_periods.append(float(candidate.period))
+            if len(results) >= max_detections:
+                break
+            continue
+
+        # Additional planets must pass threshold and not be harmonic duplicates.
+        if score < additional_min_score:
+            continue
+        if any(_periods_are_related(float(candidate.period), p) for p in picked_periods):
+            continue
+
+        folded = folded_curves[idx]
+        results.append({
+            "target_name": target_name,
+            "mission": mission,
+            "threshold": float(threshold),
+            "best_score": float(score),
+            "verdict": "TRANSIT_DETECTED",
+            "best_candidate": asdict(candidate),
+            "num_candidates": len(candidates),
+            "device": str(resolved_device),
+            "all_scores": [float(s) for s in scores],
+            "folded_lightcurve": [float(x) for x in folded],
+        })
+        picked_periods.append(float(candidate.period))
+        if len(results) >= max_detections:
+            break
+    
+    # If nothing passed threshold, still return the best one
+    if not results:
+        best_idx = int(np.argmax(scores))
+        best_candidate = candidates[best_idx]
+        best_folded = folded_curves[best_idx]
+        results = [{
+            "target_name": target_name,
+            "mission": mission,
+            "threshold": float(threshold),
+            "best_score": float(scores[best_idx]),
+            "verdict": "NO_TRANSIT",
+            "best_candidate": asdict(best_candidate),
+            "num_candidates": len(candidates),
+            "device": str(resolved_device),
+            "all_scores": [float(s) for s in scores],
+            "folded_lightcurve": [float(x) for x in best_folded],
+        }]
+    
+    return results

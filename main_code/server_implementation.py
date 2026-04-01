@@ -25,13 +25,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi import Query as QueryParam
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # internal imports
-from model_inference import DEFAULT_WEIGHTS_PATH, predict_star_transit
+from model_inference import DEFAULT_WEIGHTS_PATH, predict_star_transit, resolve_torch_device
 
 # logging setup
 LOG = logging.getLogger("cosmikai.main_code.server")
@@ -43,11 +44,11 @@ logging.basicConfig(
 
 # constants used
 # DB_PATH stores inference outputs
-# the REQUEST_TIMEOUT_SECONDS is the max timeout time
+# the REQUEST_TIMEOUT_SECONDS is the max timeout time (None = no limit)
 # the DEFAULT_THRESHOLD is the score threshold for transit detection
 # the DEFAULT_K_CANDIDATES is the default number of top BLS candidates to consider
 DB_PATH = Path(__file__).resolve().parent / "stars_cache.db"
-REQUEST_TIMEOUT_SECONDS = 180.0
+REQUEST_TIMEOUT_SECONDS = None
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_K_CANDIDATES = 15
 
@@ -73,9 +74,11 @@ CREATE TABLE IF NOT EXISTS star_predictions (
     num_candidates  INTEGER NOT NULL,
     device          TEXT NOT NULL,
     all_scores      TEXT NOT NULL,
+    folded_lightcurve TEXT,
+    candidate_rank  INTEGER NOT NULL,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
-    UNIQUE(target_name, mission, author)
+    UNIQUE(target_name, mission, author, candidate_rank)
 );
 """
 
@@ -103,6 +106,7 @@ class PredictionResponse(BaseModel):
     cached: bool
     processing_time_seconds: float
     timestamp: str
+    folded_lightcurve: list[float] | None = None
 
 # schema for a stored prediction in history
 class HistoryItem(BaseModel):
@@ -115,6 +119,7 @@ class HistoryItem(BaseModel):
     verdict: str
     num_datapoints: int | None
     timestamp: str
+    folded_lightcurve: list[float] | None = None
 
 # response schema for the /history API endpoint
 class HistoryResponse(BaseModel):
@@ -148,86 +153,103 @@ async def _init_db() -> None:
         await db.execute(_CREATE_TABLE_SQL)
         await db.commit()
 
-# gets cached prediction for the same target/mission/author combination, returns None if not found
+# gets cached predictions for the same target/mission/author combination
 # input:
 # target_name: the name of the target star
 # mission: the name of the mission
 # author: the name of the data author
 # output:
-# a dictionary with the cached prediction data if found, or None if not found
-async def _get_cached_prediction(target_name: str, mission: str, author: str) -> dict | None:
-    # queries the database for a record matching the target_name, mission, and author
+# a list of dictionaries with cached prediction data, or empty list if not found
+async def _get_cached_predictions(target_name: str, mission: str, author: str) -> list[dict]:
+    # queries the database for all records matching the target_name, mission, and author, ordered by candidate_rank
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
             SELECT * FROM star_predictions
             WHERE target_name = ? AND mission = ? AND author = ?
+            ORDER BY candidate_rank ASC
             """,
             (target_name, mission, author),
         ) as cur:
-            row = await cur.fetchone()
-    if not row:
-        return None
-    # converts the entire thing to a python dict from the json
-    data = dict(row)
-    data["best_candidate"] = json.loads(data["best_candidate"])
-    data["all_scores"] = json.loads(data["all_scores"])
-    # returns the data
-    return data
+            rows = await cur.fetchall()
+    if not rows:
+        return []
+    # converts the rows to python dicts from json
+    results = []
+    for row in rows:
+        data = dict(row)
+        data["best_candidate"] = json.loads(data["best_candidate"])
+        data["all_scores"] = json.loads(data["all_scores"])
+        results.append(data)
+    return results
 
-# creates a new prediction record in cache/ storage
+# creates new prediction records in cache/storage (one per detected planet)
 # input:
-# payload: a dictionary containing the prediction data to be stored
-async def _upsert_prediction(payload: dict) -> None:
+# payloads: a list of dictionaries, each containing a detected candidate with its data
+async def _upsert_predictions_batch(payloads: list[dict]) -> None:
+    if not payloads:
+        return
     # this gets the datetime in ISO format
     now_iso = datetime.now(timezone.utc).isoformat()
     # inserts the data into the database
     async with aiosqlite.connect(DB_PATH) as db:
+        first = payloads[0]
         await db.execute(
             """
-            INSERT INTO star_predictions (
-                target_name, mission, author, threshold, k_candidates,
-                best_score, verdict, best_candidate, num_candidates, device,
-                all_scores, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(target_name, mission, author)
-            DO UPDATE SET
-                threshold = excluded.threshold,
-                k_candidates = excluded.k_candidates,
-                best_score = excluded.best_score,
-                verdict = excluded.verdict,
-                best_candidate = excluded.best_candidate,
-                num_candidates = excluded.num_candidates,
-                device = excluded.device,
-                all_scores = excluded.all_scores,
-                updated_at = excluded.updated_at
+            DELETE FROM star_predictions
+            WHERE target_name = ? AND mission = ? AND author = ?
             """,
-            (
-                payload["target_name"],
-                payload["mission"],
-                payload["author"],
-                payload["threshold"],
-                payload["k_candidates"],
-                payload["best_score"],
-                payload["verdict"],
-                json.dumps(payload["best_candidate"]),
-                payload["num_candidates"],
-                payload["device"],
-                json.dumps(payload["all_scores"]),
-                now_iso,
-                now_iso,
-            ),
+            (first["target_name"], first["mission"], first["author"]),
         )
+        for rank, payload in enumerate(payloads):
+            await db.execute(
+                """
+                INSERT INTO star_predictions (
+                    target_name, mission, author, threshold, k_candidates,
+                    best_score, verdict, best_candidate, num_candidates, device,
+                    all_scores, folded_lightcurve, candidate_rank, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(target_name, mission, author, candidate_rank)
+                DO UPDATE SET
+                    threshold = excluded.threshold,
+                    k_candidates = excluded.k_candidates,
+                    best_score = excluded.best_score,
+                    verdict = excluded.verdict,
+                    best_candidate = excluded.best_candidate,
+                    num_candidates = excluded.num_candidates,
+                    device = excluded.device,
+                    all_scores = excluded.all_scores,
+                    folded_lightcurve = excluded.folded_lightcurve,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    payload["target_name"],
+                    payload["mission"],
+                    payload["author"],
+                    payload["threshold"],
+                    payload["k_candidates"],
+                    payload["best_score"],
+                    payload["verdict"],
+                    json.dumps(payload["best_candidate"]),
+                    payload["num_candidates"],
+                    payload["device"],
+                    json.dumps(payload["all_scores"]),
+                    json.dumps(payload.get("folded_lightcurve", [])),
+                    rank,
+                    now_iso,
+                    now_iso,
+                ),
+            )
         await db.commit()
 
 # calls on the inference pipeline 
 # input:
 # body: a PredictRequest object containing the inference parameters
 # output:
-# a dictionary containing the inference results
-def _run_pipeline_sync(body: PredictRequest) -> dict:
+# a list of dictionaries containing the inference results (multiple candidates)
+def _run_pipeline_sync(body: PredictRequest) -> list[dict]:
     # this is the main function that runs the entire inference pipeline
     target_name = (body.target_name or body.star_name or "").strip()
     return predict_star_transit(
@@ -249,6 +271,15 @@ async def lifespan(app: FastAPI):
     # startup: 
     _state.start_time = _time.monotonic()
     await _init_db()
+    
+    # Check and log CUDA availability
+    device = resolve_torch_device()
+    LOG.info("Server starting - Using device: %s", device)
+    LOG.info("CUDA available: %s", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        LOG.info("GPU: %s", torch.cuda.get_device_name(0))
+        LOG.info("GPU Memory: %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
+    
     LOG.info("Server ready. SQLite cache at %s", DB_PATH)
     yield
     # shutdown: 
@@ -305,13 +336,17 @@ async def predict(body: PredictRequest) -> PredictionResponse:
     # basic request validation checks if the required parameters are present, if not, raises a 400 error
     if not target_name or not mission:
         raise HTTPException(status_code=400, detail="star_name and mission are required.")
-    # checks the cache for existing predictions
+    # checks the cache for existing predictions (returns best one first)
     if not body.force_rerun:
-        cached = await _get_cached_prediction(target_name, mission, author)
-        if cached:
+        cached_list = await _get_cached_predictions(target_name, mission, author)
+        if cached_list:
+            cached = cached_list[0]  # return the best one
             period_days = float(cached["best_candidate"].get("period")) if cached.get("best_candidate") else None
             duration_estimate = float(cached["best_candidate"].get("duration")) if cached.get("best_candidate") else None
             depth = float(cached["best_candidate"].get("depth", 0.0)) if cached.get("best_candidate") else 0.0
+            folded = None
+            if cached.get("folded_lightcurve"):
+                folded = json.loads(cached["folded_lightcurve"]) if isinstance(cached["folded_lightcurve"], str) else cached["folded_lightcurve"]
             return PredictionResponse(
                 star_name=cached["target_name"],
                 mission=cached["mission"],
@@ -325,6 +360,7 @@ async def predict(body: PredictRequest) -> PredictionResponse:
                 cached=True,
                 processing_time_seconds=0.0,
                 timestamp=cached["updated_at"],
+                folded_lightcurve=folded,
             )
     # running inference (incase not cached or force_rerun is True)
     # defines the request and start time
@@ -341,7 +377,7 @@ async def predict(body: PredictRequest) -> PredictionResponse:
     # can increase the timeout if needed
     try:
         # runs the synchronous inference function in a separate thread and waits for the result
-        result = await asyncio.wait_for(
+        results = await asyncio.wait_for(
             asyncio.to_thread(_run_pipeline_sync, request),
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
@@ -358,40 +394,50 @@ async def predict(body: PredictRequest) -> PredictionResponse:
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unexpected server error: {exc}")
-    # define the results 
-    stored = {
-        "target_name": result["target_name"],
-        "mission": result["mission"],
-        "author": author,
-        "threshold": float(body.threshold),
-        "k_candidates": int(body.k_candidates),
-        "best_score": float(result["best_score"]),
-        "verdict": result["verdict"],
-        "best_candidate": result["best_candidate"],
-        "num_candidates": int(result["num_candidates"]),
-        "device": result["device"],
-        "all_scores": [float(s) for s in result["all_scores"]],
-    }
-    # adds to the database
-    await _upsert_prediction(stored)
-    # extracts the period, duration, and depth from the best candidate for the response
-    period_days = float(result["best_candidate"].get("period")) if result.get("best_candidate") else None
-    duration_estimate = float(result["best_candidate"].get("duration")) if result.get("best_candidate") else None
-    depth = float(result["best_candidate"].get("depth", 0.0)) if result.get("best_candidate") else 0.0
+    
+    # results is now a list of detected candidates
+    # prepare for storage and return the best one
+    stored_batch = []
+    for result in results:
+        stored = {
+            "target_name": result["target_name"],
+            "mission": result["mission"],
+            "author": author,
+            "threshold": float(body.threshold),
+            "k_candidates": int(body.k_candidates),
+            "best_score": float(result["best_score"]),
+            "verdict": result["verdict"],
+            "best_candidate": result["best_candidate"],
+            "num_candidates": int(result["num_candidates"]),
+            "device": result["device"],
+            "all_scores": [float(s) for s in result["all_scores"]],
+            "folded_lightcurve": result.get("folded_lightcurve", []),
+        }
+        stored_batch.append(stored)
+    
+    # store all detections to the database
+    await _upsert_predictions_batch(stored_batch)
+    
+    # return the best detection (first in list)
+    best_result = results[0]
+    period_days = float(best_result["best_candidate"].get("period")) if best_result.get("best_candidate") else None
+    duration_estimate = float(best_result["best_candidate"].get("duration")) if best_result.get("best_candidate") else None
+    depth = float(best_result["best_candidate"].get("depth", 0.0)) if best_result.get("best_candidate") else 0.0
     # returns the final response 
     return PredictionResponse(
-        star_name=result["target_name"],
-        mission=result["mission"],
-        score=float(result["best_score"]),
-        percentage=round(float(result["best_score"]) * 100.0, 2),
+        star_name=best_result["target_name"],
+        mission=best_result["mission"],
+        score=float(best_result["best_score"]),
+        percentage=round(float(best_result["best_score"]) * 100.0, 2),
         period_days=period_days,
-        verdict=result["verdict"],
+        verdict=best_result["verdict"],
         transit_depth_estimate=abs(depth),
         duration_estimate=duration_estimate,
         num_datapoints=None,
         cached=False,
         processing_time_seconds=round(_time.monotonic() - t0, 3),
         timestamp=datetime.now(timezone.utc).isoformat(),
+        folded_lightcurve=best_result.get("folded_lightcurve"),
     )
 
 # defines the /history endpoint to list past predictions with pagination
@@ -432,6 +478,9 @@ async def history(
     for row in rows:
         best_candidate = json.loads(row["best_candidate"])
         period_days = float(best_candidate.get("period")) if best_candidate else None
+        folded = None
+        if row.get("folded_lightcurve"):
+            folded = json.loads(row["folded_lightcurve"]) if isinstance(row["folded_lightcurve"], str) else row["folded_lightcurve"]
         items.append(
             HistoryItem(
                 id=int(row["id"]),
@@ -443,6 +492,7 @@ async def history(
                 verdict=row["verdict"],
                 num_datapoints=None,
                 timestamp=row["updated_at"],
+                folded_lightcurve=folded,
             )
         )
     # returns the history response
