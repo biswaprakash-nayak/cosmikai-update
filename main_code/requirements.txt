@@ -1,12 +1,14 @@
 # CosmiKAI — Python dependencies
-# Install with: pip install -r requirements.txt
+# Install with: pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu121
 
 # ── Required by main_code/ (inference + API server) ───────────────────────
-numpy             # Array operations across pipeline
-torch             # TransitCNN inference
-lightkurve        # MAST light curve download
-astropy           # BLS + astronomy units
-fastapi           # API framework for server_implementation.py
-uvicorn[standard] # ASGI server process
-aiosqlite         # Async SQLite cache storage
-pydantic          # Request/response validation models
+numpy                                  # Array operations across pipeline
+torch==2.5.1                           # TransitCNN inference (CUDA 12.1)
+torchvision==0.20.1                    # PyTorch vision library (CUDA 12.1)
+torchaudio==2.5.1                      # PyTorch audio library (CUDA 12.1)
+lightkurve                             # MAST light curve download
+astropy                                # BLS + astronomy units
+fastapi                                # API framework for server_implementation.py
+uvicorn[standard]                      # ASGI server process
+aiosqlite                              # Async SQLite cache storage
+pydantic                               # Request/response validation models
