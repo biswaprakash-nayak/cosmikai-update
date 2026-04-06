@@ -24,7 +24,8 @@ const AnimatedRoutes = () => {
       <motion.div key={location.pathname} variants={pageVariants} initial="initial" animate="animate" exit="exit" transition={{ duration: 0.3 }}>
         <Routes location={location}>
           <Route path="/" element={<Index />} />
-          <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/dashboard" element={<Index />} />
+          <Route path="/dashboard-legacy" element={<Dashboard />} />
           <Route path="/visualizer" element={<Visualizer />} />
           <Route path="*" element={<NotFound />} />
         </Routes>

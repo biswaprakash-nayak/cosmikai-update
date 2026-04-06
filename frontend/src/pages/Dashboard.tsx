@@ -278,12 +278,6 @@ const Dashboard = () => {
                 <Upload className="mr-2 h-3 w-3" /> FITS/CSV Ingestion
               </TabsTrigger>
               <TabsTrigger
-                value="config"
-                className="font-data text-xs uppercase tracking-wider data-[state=active]:bg-muted data-[state=active]:text-foreground rounded-md px-4 py-2"
-              >
-                <Sliders className="mr-2 h-3 w-3" /> Model Parameters
-              </TabsTrigger>
-              <TabsTrigger
                 value="stats"
                 className="font-data text-xs uppercase tracking-wider data-[state=active]:bg-muted data-[state=active]:text-foreground rounded-md px-4 py-2"
               >
@@ -390,6 +384,127 @@ const Dashboard = () => {
                   </div>
                 </div>
               </div>
+
+              {/* ── Model Parameters (collapsible under ingestion) ─────────── */}
+              <details className="panel mt-2 overflow-hidden" open>
+                <summary className="list-none cursor-pointer select-none p-4 border-b border-border/60 bg-background/30">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Sliders className="h-3.5 w-3.5 text-muted-foreground" />
+                      <p className="font-data text-xs uppercase tracking-wider text-foreground">Model Parameters</p>
+                    </div>
+                    <span className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Toggle</span>
+                  </div>
+                </summary>
+
+                <div className="p-4 lg:p-6">
+                  <div className="grid gap-6 lg:grid-cols-2">
+                    {/* Threshold + model type */}
+                    <div className="space-y-6">
+                      <div>
+                        <p className="font-data text-xs uppercase tracking-wider text-foreground mb-1">
+                          Detection Threshold
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          Verdict cutoff applied to the CNN sigmoid score.
+                          Predictions below this value are classified as NO_TRANSIT.
+                        </p>
+                      </div>
+                      <div className="space-y-4">
+                        <div className="flex justify-between font-data text-xs">
+                          <span className="text-muted-foreground">Conservative</span>
+                          <span className="text-foreground font-semibold">{threshold[0]}%</span>
+                          <span className="text-muted-foreground">Aggressive</span>
+                        </div>
+                        <Slider
+                          value={threshold}
+                          onValueChange={setThreshold}
+                          min={30}
+                          max={99}
+                          step={1}
+                          className="[&_[role=slider]]:bg-foreground [&_[role=slider]]:border-foreground"
+                        />
+                        <p className="font-data text-[10px] text-muted-foreground">
+                          Current: score ≥ {threshold[0]}% → TRANSIT_DETECTED.
+                          Applied to new queries and re-evaluates the telemetry counts above.
+                        </p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <Label className="font-data text-xs uppercase tracking-wider text-muted-foreground">
+                          Deployed Model
+                        </Label>
+                        <div className="w-full bg-background border border-border rounded-md px-3 py-2 flex items-center justify-between">
+                          <span className="font-data text-sm">1D Convolutional Neural Network</span>
+                          <span className="font-data text-[10px] text-muted-foreground bg-muted px-2 py-0.5 rounded-md uppercase tracking-wider">
+                            TransitCNN v{healthData?.model_version ?? "1.0.0"}
+                          </span>
+                        </div>
+                        <p className="font-data text-[10px] text-muted-foreground">
+                          88,961 parameters · 288 KB · optimised for satellite edge deployment
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Feature extraction */}
+                    <div className="space-y-6">
+                      <div>
+                        <p className="font-data text-xs uppercase tracking-wider text-foreground mb-1">
+                          Feature Extraction Pipeline
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          Steps applied to every light curve before CNN inference.
+                          All steps are required for the trained model.
+                        </p>
+                      </div>
+                      <div className="space-y-3">
+                        {[
+                          {
+                            key: "blsPeriodSearch",
+                            label: "BLS_PERIOD_SEARCH",
+                            desc: "Box Least Squares · 5000 trial periods · 0.6–12.0 d",
+                          },
+                          {
+                            key: "phaseFold",
+                            label: "PHASE_FOLD + BIN_512",
+                            desc: "Fold to best period · median-bin to 512 points",
+                          },
+                          {
+                            key: "fluxNormalization",
+                            label: "FLUX_NORMALISATION",
+                            desc: "Savitzky-Golay detrend · median normalise · (x−μ)/σ standardise",
+                          },
+                          {
+                            key: "transitDepthEstimate",
+                            label: "TRANSIT_DEPTH_ESTIMATE",
+                            desc: "Fractional depth δ from BLS best-fit box model",
+                          },
+                        ].map((f) => (
+                          <label
+                            key={f.key}
+                            className="flex items-start gap-3 p-3 bg-background border border-border rounded-md cursor-pointer transition-colors hover:border-muted-foreground"
+                          >
+                            <Checkbox
+                              checked={features[f.key as keyof typeof features]}
+                              onCheckedChange={(checked) =>
+                                setFeatures((p) => ({ ...p, [f.key]: !!checked }))
+                              }
+                              className="mt-0.5 border-border data-[state=checked]:bg-foreground data-[state=checked]:border-foreground rounded-sm"
+                            />
+                            <div>
+                              <span className="font-data text-xs tracking-wide block">{f.label}</span>
+                              <span className="font-data text-[10px] text-muted-foreground">{f.desc}</span>
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                      <Button className="w-full bg-foreground text-background hover:bg-foreground/90 font-data text-xs uppercase tracking-wider rounded-md">
+                        Apply Configuration
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </details>
 
               {/* ── Error panel ──────────────────────────────────────────────── */}
               {predictionError && (
@@ -521,115 +636,6 @@ const Dashboard = () => {
                   </p>
                 </motion.div>
               )}
-            </TabsContent>
-
-            {/* ── Model Parameters Tab ──────────────────────────────────────── */}
-            <TabsContent value="config">
-              <div className="grid gap-6 lg:grid-cols-2">
-                {/* Threshold + model type */}
-                <div className="panel p-6 space-y-6">
-                  <div>
-                    <p className="font-data text-xs uppercase tracking-wider text-foreground mb-1">
-                      Detection Threshold
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      Verdict cutoff applied to the CNN sigmoid score.
-                      Predictions below this value are classified as NO_TRANSIT.
-                    </p>
-                  </div>
-                  <div className="space-y-4">
-                    <div className="flex justify-between font-data text-xs">
-                      <span className="text-muted-foreground">Conservative</span>
-                      <span className="text-foreground font-semibold">{threshold[0]}%</span>
-                      <span className="text-muted-foreground">Aggressive</span>
-                    </div>
-                    <Slider
-                      value={threshold}
-                      onValueChange={setThreshold}
-                      min={30}
-                      max={99}
-                      step={1}
-                      className="[&_[role=slider]]:bg-foreground [&_[role=slider]]:border-foreground"
-                    />
-                    <p className="font-data text-[10px] text-muted-foreground">
-                      Current: score ≥ {threshold[0]}% → TRANSIT_DETECTED.
-                      Applied to new queries and re-evaluates the telemetry counts above.
-                    </p>
-                  </div>
-
-                  <div className="space-y-2">
-                    <Label className="font-data text-xs uppercase tracking-wider text-muted-foreground">
-                      Deployed Model
-                    </Label>
-                    <div className="w-full bg-background border border-border rounded-md px-3 py-2 flex items-center justify-between">
-                      <span className="font-data text-sm">1D Convolutional Neural Network</span>
-                      <span className="font-data text-[10px] text-muted-foreground bg-muted px-2 py-0.5 rounded-md uppercase tracking-wider">
-                        TransitCNN v{healthData?.model_version ?? "1.0.0"}
-                      </span>
-                    </div>
-                    <p className="font-data text-[10px] text-muted-foreground">
-                      88,961 parameters · 288 KB · optimised for satellite edge deployment
-                    </p>
-                  </div>
-                </div>
-
-                {/* Feature extraction */}
-                <div className="panel p-6 space-y-6">
-                  <div>
-                    <p className="font-data text-xs uppercase tracking-wider text-foreground mb-1">
-                      Feature Extraction Pipeline
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      Steps applied to every light curve before CNN inference.
-                      All steps are required for the trained model.
-                    </p>
-                  </div>
-                  <div className="space-y-3">
-                    {[
-                      {
-                        key: "blsPeriodSearch",
-                        label: "BLS_PERIOD_SEARCH",
-                        desc: "Box Least Squares · 5000 trial periods · 0.6–12.0 d",
-                      },
-                      {
-                        key: "phaseFold",
-                        label: "PHASE_FOLD + BIN_512",
-                        desc: "Fold to best period · median-bin to 512 points",
-                      },
-                      {
-                        key: "fluxNormalization",
-                        label: "FLUX_NORMALISATION",
-                        desc: "Savitzky-Golay detrend · median normalise · (x−μ)/σ standardise",
-                      },
-                      {
-                        key: "transitDepthEstimate",
-                        label: "TRANSIT_DEPTH_ESTIMATE",
-                        desc: "Fractional depth δ from BLS best-fit box model",
-                      },
-                    ].map((f) => (
-                      <label
-                        key={f.key}
-                        className="flex items-start gap-3 p-3 bg-background border border-border rounded-md cursor-pointer transition-colors hover:border-muted-foreground"
-                      >
-                        <Checkbox
-                          checked={features[f.key as keyof typeof features]}
-                          onCheckedChange={(checked) =>
-                            setFeatures((p) => ({ ...p, [f.key]: !!checked }))
-                          }
-                          className="mt-0.5 border-border data-[state=checked]:bg-foreground data-[state=checked]:border-foreground rounded-sm"
-                        />
-                        <div>
-                          <span className="font-data text-xs tracking-wide block">{f.label}</span>
-                          <span className="font-data text-[10px] text-muted-foreground">{f.desc}</span>
-                        </div>
-                      </label>
-                    ))}
-                  </div>
-                  <Button className="w-full bg-foreground text-background hover:bg-foreground/90 font-data text-xs uppercase tracking-wider rounded-md">
-                    Apply Configuration
-                  </Button>
-                </div>
-              </div>
             </TabsContent>
 
             {/* ── System Telemetry Tab ──────────────────────────────────────── */}

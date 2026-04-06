@@ -34,6 +34,11 @@ from pydantic import BaseModel, Field
 
 # internal imports
 from model_inference import DEFAULT_WEIGHTS_PATH, predict_star_transit, resolve_torch_device
+from star_details_service import (
+    StarDetailsFetchError,
+    StarDetailsResponse,
+    fetch_star_details_from_mast,
+)
 
 # logging setup
 LOG = logging.getLogger("cosmikai.main_code.server")
@@ -123,6 +128,7 @@ class HistoryItem(BaseModel):
     score: float
     percentage: float
     period_days: float | None
+    transit_depth_estimate: float | None = None
     verdict: str
     num_datapoints: int | None
     timestamp: str
@@ -335,6 +341,18 @@ async def health() -> HealthResponse:
         total_predictions=total_predictions,
         uptime_seconds=round(_time.monotonic() - _state.start_time, 2),
     )
+
+
+@app.get("/api/star-details", response_model=StarDetailsResponse)
+async def star_details(star_name: str = QueryParam(..., min_length=1)) -> StarDetailsResponse:
+    clean_name = star_name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="star_name is required.")
+
+    try:
+        return await asyncio.to_thread(fetch_star_details_from_mast, clean_name)
+    except StarDetailsFetchError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
 
 # defines the /predict endpoint to run inference on the target
 # input:
@@ -576,6 +594,7 @@ async def history(
     for row in rows:
         best_candidate = json.loads(row["best_candidate"])
         period_days = float(best_candidate.get("period")) if best_candidate else None
+        depth = float(best_candidate.get("depth", 0.0)) if best_candidate else None
         folded = None
         if row.get("folded_lightcurve"):
             folded = json.loads(row["folded_lightcurve"]) if isinstance(row["folded_lightcurve"], str) else row["folded_lightcurve"]
@@ -587,6 +606,7 @@ async def history(
                 score=float(row["best_score"]),
                 percentage=round(float(row["best_score"]) * 100.0, 2),
                 period_days=period_days,
+                transit_depth_estimate=abs(depth) if depth is not None else None,
                 verdict=row["verdict"],
                 num_datapoints=None,
                 timestamp=row["updated_at"],
