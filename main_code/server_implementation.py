@@ -1,8 +1,8 @@
 # This is the api server implementation using FASTAPI
 
-# last updated: 28-March-2026
+# last updated: 5-April-2026
 # updated by: Biswaprakash Nayak
-# changes made: made this code and added all the neccesary functions.
+# changes made: added logging
 
 # imports
 # asyncio for running sync inference in a worker thread with timeout handling
@@ -23,6 +23,7 @@ import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
 import aiosqlite
 import torch
@@ -51,11 +52,14 @@ DB_PATH = Path(__file__).resolve().parent / "stars_cache.db"
 REQUEST_TIMEOUT_SECONDS = None
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_K_CANDIDATES = 15
+INFERENCE_HEARTBEAT_SECONDS = 10.0
 
 # internal state tracking
 class _State:
     # server uptime tracking 
     start_time: float = 0.0
+    progress_lock: Lock = Lock()
+    progress: dict[str, dict] = {}
 
 _state = _State()
 
@@ -90,6 +94,9 @@ class PredictRequest(BaseModel):
     author: str = Field(default="None")
     threshold: float = Field(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0)
     k_candidates: int = Field(default=DEFAULT_K_CANDIDATES, ge=1, le=100)
+    cutoff_mode: str = Field(default="relative")
+    confidence_drop_fraction: float = Field(default=0.10, ge=0.0, le=1.0)
+    elbow_plus_extra: int = Field(default=1, ge=0, le=10)
     force_rerun: bool = Field(default=False)
 
 # output schema for the /predict API endpoint
@@ -249,7 +256,7 @@ async def _upsert_predictions_batch(payloads: list[dict]) -> None:
 # body: a PredictRequest object containing the inference parameters
 # output:
 # a list of dictionaries containing the inference results (multiple candidates)
-def _run_pipeline_sync(body: PredictRequest) -> list[dict]:
+def _run_pipeline_sync(body: PredictRequest, progress_callback=None) -> list[dict]:
     # this is the main function that runs the entire inference pipeline
     target_name = (body.target_name or body.star_name or "").strip()
     return predict_star_transit(
@@ -258,8 +265,12 @@ def _run_pipeline_sync(body: PredictRequest) -> list[dict]:
         author=body.author,
         threshold=body.threshold,
         k_candidates=body.k_candidates,
+        cutoff_mode=body.cutoff_mode,
+        confidence_drop_fraction=body.confidence_drop_fraction,
+        elbow_plus_extra=body.elbow_plus_extra,
         model_weights_path=DEFAULT_WEIGHTS_PATH,
         device=None,
+        progress_callback=progress_callback,
     )
 
 # defines the FastAPI app, handling the startup and shutdown
@@ -281,9 +292,13 @@ async def lifespan(app: FastAPI):
         LOG.info("GPU Memory: %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
     
     LOG.info("Server ready. SQLite cache at %s", DB_PATH)
-    yield
-    # shutdown: 
-    LOG.info("Server shutdown.")
+    try:
+        yield
+    except asyncio.CancelledError:
+        LOG.info("Server received shutdown signal.")
+    finally:
+        # shutdown: 
+        LOG.info("Server shutting down.")
 
 # initializes the FastAPI app
 app = FastAPI(
@@ -336,6 +351,33 @@ async def predict(body: PredictRequest) -> PredictionResponse:
     # basic request validation checks if the required parameters are present, if not, raises a 400 error
     if not target_name or not mission:
         raise HTTPException(status_code=400, detail="star_name and mission are required.")
+    LOG.info("PREDICT START star=%s mission=%s force_rerun=%s", target_name, mission, body.force_rerun)
+    progress_key = f"{target_name}:{mission}:{_time.monotonic():.6f}"
+    last_stage: str | None = None
+    last_pct_bucket: int = -1
+
+    def _progress_callback(stage: str, percent: int, message: str) -> None:
+        nonlocal last_stage, last_pct_bucket
+        pct = int(max(0, min(100, percent)))
+        pct_bucket = pct // 10
+        with _state.progress_lock:
+            _state.progress[progress_key] = {
+                "stage": stage,
+                "percent": pct,
+                "message": message,
+                "updated": _time.monotonic(),
+            }
+        if stage != last_stage or pct_bucket > last_pct_bucket:
+            LOG.info(
+                "Progress update star=%s mission=%s stage=%s %s%% (%s)",
+                target_name,
+                mission,
+                stage,
+                pct,
+                message,
+            )
+            last_stage = stage
+            last_pct_bucket = pct_bucket
     # checks the cache for existing predictions (returns best one first)
     if not body.force_rerun:
         cached_list = await _get_cached_predictions(target_name, mission, author)
@@ -371,28 +413,81 @@ async def predict(body: PredictRequest) -> PredictionResponse:
         author=author,
         threshold=body.threshold,
         k_candidates=body.k_candidates,
+        cutoff_mode=body.cutoff_mode,
+        confidence_drop_fraction=body.confidence_drop_fraction,
+        elbow_plus_extra=body.elbow_plus_extra,
         force_rerun=body.force_rerun,
     )
     # runs the inference pipeline in a worker thread
-    # can increase the timeout if needed
+    # logs heartbeat so long requests don't look frozen
     try:
-        # runs the synchronous inference function in a separate thread and waits for the result
-        results = await asyncio.wait_for(
-            asyncio.to_thread(_run_pipeline_sync, request),
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        task = asyncio.create_task(asyncio.to_thread(_run_pipeline_sync, request, _progress_callback))
+        while True:
+            elapsed = _time.monotonic() - t0
+            if REQUEST_TIMEOUT_SECONDS is not None:
+                remaining = REQUEST_TIMEOUT_SECONDS - elapsed
+                if remaining <= 0:
+                    task.cancel()
+                    raise asyncio.TimeoutError
+                wait_window = min(INFERENCE_HEARTBEAT_SECONDS, remaining)
+            else:
+                wait_window = INFERENCE_HEARTBEAT_SECONDS
+
+            try:
+                results = await asyncio.wait_for(asyncio.shield(task), timeout=wait_window)
+                break
+            except asyncio.TimeoutError:
+                with _state.progress_lock:
+                    progress = _state.progress.get(progress_key)
+                if progress:
+                    LOG.info(
+                        "Inference still running star=%s mission=%s elapsed=%.1fs stage=%s %s%% (%s)",
+                        target_name,
+                        mission,
+                        elapsed,
+                        progress.get("stage", "unknown"),
+                        progress.get("percent", 0),
+                        progress.get("message", ""),
+                    )
+                else:
+                    LOG.info(
+                        "Inference still running for star=%s mission=%s (elapsed=%.1fs)",
+                        target_name,
+                        mission,
+                        elapsed,
+                    )
+                continue
     # handles the timeout error if the inference takes too long and returns a 408 HTTP error
     except asyncio.TimeoutError:
+        timeout_detail = (
+            f"{int(REQUEST_TIMEOUT_SECONDS)} seconds"
+            if REQUEST_TIMEOUT_SECONDS is not None
+            else "the configured limit"
+        )
+        with _state.progress_lock:
+            _state.progress.pop(progress_key, None)
         raise HTTPException(
             status_code=408,
-            detail=f"Inference timed out after {int(REQUEST_TIMEOUT_SECONDS)} seconds.",
+            detail=f"Inference timed out after {timeout_detail}.",
         )
+    # handles user interruption (Ctrl+C) gracefully
+    except asyncio.CancelledError:
+        LOG.warning("Inference cancelled by user")
+        with _state.progress_lock:
+            _state.progress.pop(progress_key, None)
+        raise HTTPException(status_code=499, detail="Request cancelled by user")
     # these catch other errors
     except ValueError as exc:
+        with _state.progress_lock:
+            _state.progress.pop(progress_key, None)
         raise HTTPException(status_code=404, detail=str(exc))
     except RuntimeError as exc:
+        with _state.progress_lock:
+            _state.progress.pop(progress_key, None)
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:
+        with _state.progress_lock:
+            _state.progress.pop(progress_key, None)
         raise HTTPException(status_code=500, detail=f"Unexpected server error: {exc}")
     
     # results is now a list of detected candidates
@@ -424,6 +519,9 @@ async def predict(body: PredictRequest) -> PredictionResponse:
     duration_estimate = float(best_result["best_candidate"].get("duration")) if best_result.get("best_candidate") else None
     depth = float(best_result["best_candidate"].get("depth", 0.0)) if best_result.get("best_candidate") else 0.0
     # returns the final response 
+    LOG.info("PREDICT END star=%s mission=%s elapsed=%.2fs", target_name, mission, _time.monotonic() - t0)
+    with _state.progress_lock:
+        _state.progress.pop(progress_key, None)
     return PredictionResponse(
         star_name=best_result["target_name"],
         mission=best_result["mission"],

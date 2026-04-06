@@ -1,8 +1,8 @@
 # This is the main server inference code that runs the model.
 
-# last updated: 28-March-2026
+# last updated: 5-April-2026
 # updated by: Biswaprakash Nayak
-# changes made: made this code and added all the neccesary functions.
+# changes made: added logging
 
 
 # imports 
@@ -10,13 +10,15 @@
 # numpy for array manipulation
 # pathlib for file path handling
 # dataclasses for converting Candidate objects to dicts for easier output formatting
-#------------------------------------
+# logging for logging progress and information during inference
+# time for measuring inference time
+# ------------------------------------
 # below are imports from other files in this project
 # candidates for the Candidate class definition
 # data_ingestion for getting time and flux arrays from the lightcurve data
 # preprocessing for the bls algorithm and folding the lightcurve data into bins
 
-#from __future__ import annotations  # can help with older Python versions, uncomment if needed
+# from __future__ import annotations  # can help with older Python versions, uncomment if needed
 
 # imported external libraries
 from dataclasses import asdict
@@ -24,10 +26,16 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import logging
+import time as timer
+from typing import Callable
 # imported internal modules
 from candidates import Candidate
 from data_ingestion import get_time_flux
 from preprocessing import bls_topk, fold_to_bins
+
+# set up logging for this module
+LOG = logging.getLogger("cosmikai.model_inference")
 
 # this function checks if two periods are related by being harmonics or subharmonics of each other, which helps in filtering out duplicate candidates that are just harmonics of the same signal
 # inputs:
@@ -47,6 +55,45 @@ def _periods_are_related(p1: float, p2: float, rel_tol: float = 0.04) -> bool:
         if abs(ratio - n) <= rel_tol * n:
             return True
     return False
+
+# this function computes a dynamic cutoff score for determining which candidates are considered 
+# inputs:
+# sorted_scores: a list of scores for the candidates, sorted in descending order
+# threshold: the base score threshold to consider for detection
+# cutoff_mode: the mode to use for computing the cutoff, either "relative" or "elbow"
+# confidence_drop_fraction: the fraction by which the score can drop from the best score to still be considered a detection
+# output:
+# a tuple containing the computed cutoff score, the source of the cutoff (for logging), and the index of the elbow if elbow mode is used
+def _compute_dynamic_cutoff(
+    sorted_scores: list[float],
+    threshold: float,
+    cutoff_mode: str,
+    confidence_drop_fraction: float,
+) -> tuple[float, str, int | None]:
+    # if there are no scores, return the threshold as the cutoff and indicate that the source is "empty-scores"
+    if not sorted_scores:
+        return float(threshold), "empty-scores", None
+    # the best score is the first one in the sorted list
+    best_score = float(sorted_scores[0])
+    # the relative cutoff is calculated as the maximum of the threshold and the best score multiplied by (1 - confidence_drop_fraction)
+    rel_cutoff = max(float(threshold), best_score * (1.0 - float(confidence_drop_fraction)))
+    mode = (cutoff_mode or "relative").lower().strip()
+    # if the mode is not "elbow", return the relative cutoff and indicate that the source is "relative"
+    if mode != "elbow":
+        return rel_cutoff, "relative", None
+    if len(sorted_scores) < 3:
+        return rel_cutoff, "elbow-fallback-short", None
+    # compute the gaps between consecutive scores to find the elbow point
+    gaps = [float(sorted_scores[i] - sorted_scores[i + 1]) for i in range(len(sorted_scores) - 1)]
+    elbow_idx = int(np.argmax(gaps))
+    elbow_gap = gaps[elbow_idx]
+    # If the score drop is too small, elbow is ambiguous; fall back to relative mode.
+    if elbow_gap < 0.015:
+        return rel_cutoff, "elbow-fallback-weak-gap", None
+    upper = float(sorted_scores[elbow_idx])
+    lower = float(sorted_scores[elbow_idx + 1])
+    elbow_cutoff = max(float(threshold), 0.5 * (upper + lower))
+    return elbow_cutoff, f"elbow-gap@{elbow_idx}:{elbow_gap:.4f}", elbow_idx
 
 # path to model weights
 DEFAULT_WEIGHTS_PATH = (
@@ -175,18 +222,40 @@ def build_candidate_matrix(
     flux: np.ndarray,
     candidates: list[Candidate],
     nbins: int = 512,
+    use_gpu: bool = False,
+    device: torch.device | None = None,
+    progress_callback: Callable[[str, int, str], None] | None = None,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     # checks if there are any candidates, if not raises an error
     if not candidates:
         raise ValueError("No BLS candidates were provided.")
     # for each candidate, it folds the lightcurve data into the bins
     # then it returns a numpy array with all the converted candidates
+    total_candidates = len(candidates)
+    next_progress_pct = 10
+    LOG.info("Folding progress: 0%% (0/%s candidates)", total_candidates)
     rows = []
     folded_curves = []
-    for cand in candidates:
-        folded = fold_to_bins(time, flux, cand.period, cand.t0, nbins=nbins)
+    for idx, cand in enumerate(candidates, start=1):
+        folded = fold_to_bins(
+            time,
+            flux,
+            cand.period,
+            cand.t0,
+            nbins=nbins,
+            use_gpu=use_gpu,
+            device=device,
+            progress_callback=progress_callback,
+        )
         rows.append(folded)
         folded_curves.append(folded)
+        progress_pct = int((idx * 100) / total_candidates)
+        if progress_pct >= next_progress_pct or idx == total_candidates:
+            LOG.info("Folding progress: %s%% (%s/%s candidates)", progress_pct, idx, total_candidates)
+            if progress_callback is not None:
+                progress_callback("folding", progress_pct, f"folded {idx}/{total_candidates} candidates")
+            while next_progress_pct <= progress_pct:
+                next_progress_pct += 10
     # stacks the folded lightcurves into a 2D array and converts to float32 for the model
     X = np.stack(rows, axis=0).astype(np.float32)
     # checks for infnite matrix
@@ -230,34 +299,110 @@ def predict_star_transit(
     author: str = "None",
     threshold: float = 0.5,
     k_candidates: int = 15,
+    cutoff_mode: str = "relative",
+    confidence_drop_fraction: float = 0.10,
+    elbow_plus_extra: int = 1,
     model_weights_path: str | Path = DEFAULT_WEIGHTS_PATH,
     device: str | None = None,
+    progress_callback: Callable[[str, int, str], None] | None = None,
 ) -> list[dict]:
-    # loads the model and resolves the device for inference
+    t_total = timer.time()
+    LOG.info(f"=== INFERENCE START: {target_name} on {mission} ===")
+    if progress_callback is not None:
+        progress_callback("pipeline", 0, "inference started")
+    
+    # Step 1: Load model
+    LOG.info("Step 1/5: Loading model...")
+    t1 = timer.time()
     model, resolved_device = load_trained_model(model_weights_path, device=device)
-    # gets the time and flux arrays for the target star and mission using the data ingestion function
+    LOG.info(f"  Model loaded on {resolved_device} in {timer.time()-t1:.2f}s")
+    if progress_callback is not None:
+        progress_callback("model", 100, f"loaded on {resolved_device}")
+    
+    # Step 2: Download lightcurve
+    LOG.info("Step 2/5: Downloading lightcurve from MAST...")
+    t2 = timer.time()
     time, flux = get_time_flux(
         target_name=target_name,
         mission=mission,
         author=author,
         download_all=True,
+        progress_callback=progress_callback,
     )
-    # runs the BLS algorithm to get the top k candidates and builds the candidate matrix for the model
-    candidates = bls_topk(time, flux, k=k_candidates)
-    # builds the candidate matrix for the model using the previous function
-    X, folded_curves = build_candidate_matrix(time, flux, candidates, nbins=512)
-    # scores the candidates using the model and the previous function
+    LOG.info(f"  Downloaded {len(time)} datapoints in {timer.time()-t2:.2f}s")
+    
+    # Step 3: Run BLS
+    LOG.info(f"Step 3/5: Running BLS to find top {k_candidates} candidates...")
+    t3 = timer.time()
+    candidates = bls_topk(
+        time,
+        flux,
+        k=k_candidates,
+        use_gpu=resolved_device.type == "cuda",
+        progress_callback=progress_callback,
+    )
+    LOG.info(f"  BLS completed in {timer.time()-t3:.2f}s, found {len(candidates)} candidates")
+    
+    # Step 4: Build candidate matrix and score
+    LOG.info("Step 4/5: Folding lightcurves and scoring candidates...")
+    t4 = timer.time()
+    X, folded_curves = build_candidate_matrix(
+        time,
+        flux,
+        candidates,
+        nbins=512,
+        use_gpu=resolved_device.type == "cuda",
+        device=resolved_device,
+        progress_callback=progress_callback,
+    )
+    LOG.info(f"  Built candidate matrix {X.shape} in {timer.time()-t4:.2f}s")
+    LOG.info("Step 4/5 (continued): Running model inference on GPU...")
+    t4b = timer.time()
     scores = score_candidates(model, X, resolved_device)
+    LOG.info(f"  Model inference completed in {timer.time()-t4b:.2f}s")
+    if progress_callback is not None:
+        progress_callback("model_inference", 100, f"scored {len(scores)} candidates")
+    
+    # Step 5: Filter and format results
+    LOG.info("Step 5/5: Filtering results and preparing output...")
     
     # Create list of (index, score) tuples and sort by score descending
     scored_candidates = list(enumerate(scores))
     scored_candidates.sort(key=lambda x: x[1], reverse=True)
+
+    sorted_scores = [float(s) for _, s in scored_candidates]
+    dynamic_cutoff, cutoff_source, elbow_idx = _compute_dynamic_cutoff(
+        sorted_scores=sorted_scores,
+        threshold=float(threshold),
+        cutoff_mode=cutoff_mode,
+        confidence_drop_fraction=float(confidence_drop_fraction),
+    )
+    best_score = sorted_scores[0] if sorted_scores else 0.0
+    LOG.info(
+        "Dynamic confidence cutoff: mode=%s source=%s best_score=%.4f cutoff=%.4f fraction=%.2f",
+        cutoff_mode,
+        cutoff_source,
+        best_score,
+        dynamic_cutoff,
+        confidence_drop_fraction,
+    )
     
     # Filter and keep top detections that pass threshold, with period de-duplication.
     results = []
     max_detections = 5
-    additional_min_score = max(float(threshold), 0.70)
     picked_periods: list[float] = []
+    # If elbow mode is active and the detector found an elbow, optionally include
+    # a small number of extra candidates beyond the elbow before applying cutoff.
+    min_results_required = 1
+    if cutoff_mode.lower().strip() == "elbow" and elbow_idx is not None:
+        min_results_required = min(max_detections, max(1, (elbow_idx + 1) + max(0, int(elbow_plus_extra))))
+        LOG.info(
+            "Elbow retention rule: elbow_idx=%s plus_extra=%s => min_results_required=%s",
+            elbow_idx,
+            elbow_plus_extra,
+            min_results_required,
+        )
+
     for idx, score in scored_candidates:
         candidate = candidates[idx]
 
@@ -281,9 +426,9 @@ def predict_star_transit(
                 break
             continue
 
-        # Additional planets must pass threshold and not be harmonic duplicates.
-        if score < additional_min_score:
-            continue
+        # Additional planets must remain near the top score and not be harmonic duplicates.
+        if score < dynamic_cutoff and len(results) >= min_results_required:
+            break
         if any(_periods_are_related(float(candidate.period), p) for p in picked_periods):
             continue
 
@@ -321,5 +466,11 @@ def predict_star_transit(
             "all_scores": [float(s) for s in scores],
             "folded_lightcurve": [float(x) for x in best_folded],
         }]
+    
+    total_time = timer.time() - t_total
+    LOG.info(f"  Results: {len(results)} detections")
+    LOG.info(f"=== INFERENCE COMPLETE in {total_time:.2f}s ===")
+    if progress_callback is not None:
+        progress_callback("pipeline", 100, "inference complete")
     
     return results
