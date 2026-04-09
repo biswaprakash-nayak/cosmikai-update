@@ -3,3 +3,4 @@
 /main_code/guided_demo_inference.py
 /main_code/period_batch.json
 /main_code/period_forced_inference.py
+/main_code/download_to_demo_test_data.py
