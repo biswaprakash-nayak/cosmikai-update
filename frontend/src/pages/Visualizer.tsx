@@ -179,11 +179,12 @@ const temperatureToStarColor = (teff: number | null | undefined) => {
   if (!teff || !Number.isFinite(teff)) {
     return "#ffcc66";
   }
-  if (teff < 3800) return "#ff9447";
-  if (teff < 5000) return "#ffbf6b";
-  if (teff < 6500) return "#ffc95a";
-  if (teff < 7600) return "#ffe39f";
-  return "#bfd8ff";
+  if (teff < 3800) return "#ff8e45";
+  if (teff < 5000) return "#ffb869";
+  if (teff < 6100) return "#ffd47f";
+  if (teff < 7000) return "#fff3de";
+  if (teff < 8200) return "#d7e6ff";
+  return "#b8d2ff";
 };
 
 const radiusToStarScale = (radiusRsun: number | null | undefined) => {
@@ -246,6 +247,10 @@ function Star({ onClick, isPaused, radius, color, lightIntensity }: { onClick?: 
   const coronaRef = useRef<THREE.Mesh>(null);
   const starSpinRef = useRef(0);
   const pulseTimeRef = useRef(0);
+  const secondaryLightColor = useMemo(() => {
+    const mixed = new THREE.Color(color).lerp(new THREE.Color("#ffffff"), 0.58);
+    return `#${mixed.getHexString()}`;
+  }, [color]);
   
   useFrame((_, delta) => {
     if (meshRef.current) {
@@ -280,7 +285,7 @@ function Star({ onClick, isPaused, radius, color, lightIntensity }: { onClick?: 
         <meshBasicMaterial color={color} transparent opacity={0.08} side={THREE.DoubleSide} />
       </mesh>
       <pointLight position={[0, 0, 0]} intensity={lightIntensity * 42} color={color} distance={0} decay={1.25} />
-      <pointLight position={[0, 0, 0]} intensity={lightIntensity * 10} color="#fff6dc" distance={0} decay={1.35} />
+      <pointLight position={[0, 0, 0]} intensity={lightIntensity * 10} color={secondaryLightColor} distance={0} decay={1.35} />
     </group>
   );
 }
@@ -690,6 +695,7 @@ const Visualizer = () => {
   const [showPlanetNames, setShowPlanetNames] = useState(true);
   const [cameraPreset, setCameraPreset] = useState<CameraPreset>("cinematic");
   const [minimapTime, setMinimapTime] = useState(0);
+  const suppressNextControlStartRef = useRef(false);
 
   const cameraPresetOffset =
     cameraPreset === "tactical"
@@ -769,6 +775,7 @@ const Visualizer = () => {
   const showSuggestions = isSearchFocused && normalizedSearch.length > 0;
 
   const selectSystemFromSearch = (systemIdx: number) => {
+    suppressNextControlStartRef.current = true;
     setSelectedStarIdx(systemIdx);
     setSelectedPlanetIdx(0);
     setFocusOnStar(true);
@@ -835,6 +842,10 @@ const Visualizer = () => {
   }, [selectedStar, starDetailsCache]);
 
   const planetCount = selectedStar?.predictions.length ?? 0;
+  const validSystemPeriods = (selectedStar?.predictions ?? [])
+    .map((pred) => pred.period_days)
+    .filter((p): p is number => Number.isFinite(p) && p > 0);
+  const minSystemPeriodDays = validSystemPeriods.length > 0 ? Math.min(...validSystemPeriods) : null;
   const orbitRadiusMin = 2.8;
   const orbitRadiusMax = 34.0;
   const orbitSpacingMin = 2.4;
@@ -860,8 +871,12 @@ const Visualizer = () => {
 
   const periodToOrbitSpeed = (period: number | null | undefined, index: number) => {
     if (Number.isFinite(period) && (period as number) > 0) {
-      const radius = periodToOrbitRadius(period, index);
-      return Math.max(0.12, Math.min(1.2, 2.3 / Math.pow(radius, 0.9)));
+      // Kepler-style angular speed: omega ~ 1 / period.
+      // Scale by system minimum period so relative speed differences are obvious.
+      const periodDays = period as number;
+      const periodRatio = minSystemPeriodDays != null ? periodDays / minSystemPeriodDays : periodDays / earthPeriodDays;
+      const rawSpeed = 1.35 / Math.pow(Math.max(periodRatio, 1e-6), 0.92);
+      return clamp(rawSpeed, 0.04, 1.65);
     }
 
     if (planetCount <= 1) {
@@ -913,15 +928,42 @@ const Visualizer = () => {
           };
         })
         .sort((a, b) => a.orbitRadius - b.orbitRadius)
-        .map((planet, sortedIdx, arr) => {
-          if (sortedIdx === 0) {
-            return planet;
+        .map((planet) => ({ ...planet }))
+        .map((planet, idx, arr) => {
+          if (idx === 0 && arr.length > 1) {
+            const count = arr.length;
+            const maxGapCapacity = (orbitRadiusMax - orbitRadiusMin) / Math.max(1, count - 1);
+            const effectiveSpacing = Math.min(orbitSpacingMin, maxGapCapacity);
+
+            // Forward pass: enforce ascending radii with minimum spacing.
+            arr[0].orbitRadius = clamp(
+              arr[0].orbitRadius,
+              orbitRadiusMin,
+              orbitRadiusMax - effectiveSpacing * (count - 1),
+            );
+            for (let i = 1; i < count; i += 1) {
+              const minAllowed = arr[i - 1].orbitRadius + effectiveSpacing;
+              arr[i].orbitRadius = Math.max(arr[i].orbitRadius, minAllowed);
+            }
+
+            // Backward pass if the outermost orbit overflowed max bound.
+            if (arr[count - 1].orbitRadius > orbitRadiusMax) {
+              arr[count - 1].orbitRadius = orbitRadiusMax;
+              for (let i = count - 2; i >= 0; i -= 1) {
+                const maxAllowed = arr[i + 1].orbitRadius - effectiveSpacing;
+                arr[i].orbitRadius = Math.min(arr[i].orbitRadius, maxAllowed);
+              }
+            }
+
+            // Final guard to keep the innermost orbit inside the minimum bound.
+            if (arr[0].orbitRadius < orbitRadiusMin) {
+              arr[0].orbitRadius = orbitRadiusMin;
+              for (let i = 1; i < count; i += 1) {
+                arr[i].orbitRadius = Math.max(arr[i].orbitRadius, arr[i - 1].orbitRadius + effectiveSpacing);
+              }
+            }
           }
-          const minAllowed = arr[sortedIdx - 1].orbitRadius + orbitSpacingMin;
-          return {
-            ...planet,
-            orbitRadius: Math.min(orbitRadiusMax, Math.max(planet.orbitRadius, minAllowed)),
-          };
+          return planet;
         })
         .sort((a, b) => a.predIdx - b.predIdx)
     : [];
@@ -1096,13 +1138,17 @@ const Visualizer = () => {
             starColor={starColor}
             starLightIntensity={starLightIntensity}
             onSystemClick={(idx) => {
+              suppressNextControlStartRef.current = true;
               setSelectedStarIdx(idx);
               setSelectedPlanetIdx(0);
               setFocusOnStar(true);
+              setTrackPlanet(false);
+              setCameraPreset((prev) => (prev === "free" ? "cinematic" : prev));
               selectedPlanetFocusRef.current.set(0, 0, 0);
               setFocusKey((k) => k + 1);
             }}
             onPlanetClick={(sysIdx, predIdx) => {
+              suppressNextControlStartRef.current = true;
               setSelectedStarIdx(sysIdx);
               setSelectedPlanetIdx(predIdx);
               setFocusOnStar(false);
@@ -1110,6 +1156,10 @@ const Visualizer = () => {
               setFocusKey((k) => k + 1);
             }}
             onUserCameraControl={() => {
+              if (suppressNextControlStartRef.current) {
+                suppressNextControlStartRef.current = false;
+                return;
+              }
               setCameraPreset((prev) => (prev === "free" ? prev : "free"));
             }}
           />
@@ -1133,7 +1183,7 @@ const Visualizer = () => {
                 <ArrowLeft className="h-3.5 w-3.5" />
               </Button>
               <div onClick={() => navigate("/")} className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-opacity">
-                <span className="font-data text-[10px] tracking-[0.18em] text-neutral-100">COSMIK_AI</span>
+                <span className="font-data text-[10px] tracking-[0.18em] text-neutral-100">CosmikAi</span>
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -1266,7 +1316,10 @@ const Visualizer = () => {
               <div className="absolute left-3 right-2 top-1/2 h-px bg-gray-300/20" />
               <button
                 onClick={() => {
+                  suppressNextControlStartRef.current = true;
                   setFocusOnStar(true);
+                  setTrackPlanet(false);
+                  setCameraPreset((prev) => (prev === "free" ? "cinematic" : prev));
                   selectedPlanetFocusRef.current.set(0, 0, 0);
                   setFocusKey((k) => k + 1);
                 }}
@@ -1282,6 +1335,7 @@ const Visualizer = () => {
                 <button
                   key={planet.id}
                   onClick={() => {
+                    suppressNextControlStartRef.current = true;
                     setSelectedPlanetIdx(planet.predIdx);
                     setFocusOnStar(false);
                     setTrackPlanet(true);
@@ -1421,7 +1475,7 @@ const Visualizer = () => {
               const maxRadius = Math.max(1, selectedSystemOrbitExtent);
               const norm = planet.orbitRadius / maxRadius;
               const ringSizePct = 18 + norm * 74;
-              const angle = (planet.orbitPhaseStart ?? phaseSeedFromPlanet(planet.id, idx)) + minimapTime * planet.orbitSpeed;
+              const angle = (planet.orbitPhaseStart ?? phaseSeedFromPlanet(planet.id, idx)) - minimapTime * planet.orbitSpeed;
               const ringRadiusPct = ringSizePct / 2;
               const dotX = 50 + Math.cos(angle) * ringRadiusPct;
               const dotY = 50 + Math.sin(angle) * ringRadiusPct;
@@ -1430,7 +1484,7 @@ const Visualizer = () => {
                   <svg className="absolute inset-0 pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
                     <circle cx="50" cy="50" r={ringRadiusPct} fill="none" stroke="rgba(156,163,175,0.22)" strokeWidth="0.6" />
                     <path
-                      d={orbitArcPath(50, 50, ringRadiusPct, angle - 0.6, angle)}
+                      d={orbitArcPath(50, 50, ringRadiusPct, angle, angle + 0.6)}
                       fill="none"
                       stroke="rgba(156,163,175,0.65)"
                       strokeOpacity="0.6"

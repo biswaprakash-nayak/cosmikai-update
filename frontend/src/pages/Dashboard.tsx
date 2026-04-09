@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Upload, Search, Sliders, BarChart3, Terminal, Eye,
+  Upload, Search, Sliders, BarChart3, Eye,
   FileUp, CheckCircle2, AlertTriangle, Target, Activity,
   Loader2, Radio, Clock, Zap, AlertCircle,
 } from "lucide-react";
@@ -239,8 +239,7 @@ const Dashboard = () => {
             onClick={() => navigate("/")}
             className="flex items-center gap-3 cursor-pointer hover:opacity-80 transition-opacity"
           >
-            <Terminal className="h-5 w-5 text-foreground" />
-            <span className="font-data text-sm font-semibold tracking-wide">COSMIK_AI</span>
+            <span className="font-data text-sm font-semibold tracking-wide">CosmikAi</span>
           </div>
           <span className="font-data text-xs text-muted-foreground ml-4">/ DASHBOARD</span>
         </div>

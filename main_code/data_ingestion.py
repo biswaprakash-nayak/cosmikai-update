@@ -179,15 +179,37 @@ def process_lightcurve_data(
     if hasattr(lightcurves, "stitch"):
         _report(25, "stitching lightcurves")
         # Astropy may emit a non-fatal metadata cast RuntimeWarning when combining products.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.filterwarnings(
-                "ignore",
-                message="invalid value encountered in cast",
-                category=RuntimeWarning,
-            )
-            processed_lightcurves = lightcurves.stitch()
-        if caught:
-            LOG.info("Suppressed %s non-fatal metadata warning(s) during stitch.", len(caught))
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.filterwarnings(
+                    "ignore",
+                    message="invalid value encountered in cast",
+                    category=RuntimeWarning,
+                )
+                processed_lightcurves = lightcurves.stitch()
+            if caught:
+                LOG.info("Suppressed %s non-fatal metadata warning(s) during stitch.", len(caught))
+        except Exception as stitch_exc:
+            # Some MAST products have incompatible metadata/column dtypes (e.g. quality field).
+            # Fallback: use the longest valid single product so inference can proceed.
+            LOG.warning("Stitch failed (%s). Falling back to best single product.", stitch_exc)
+            best_lc = None
+            best_n = -1
+            for idx, lc_piece in enumerate(lightcurves):
+                try:
+                    t = np.asarray(lc_piece.time.value, dtype=np.float64)
+                    f = np.asarray(lc_piece.flux.value, dtype=np.float64)
+                    m = np.isfinite(t) & np.isfinite(f)
+                    n = int(np.count_nonzero(m))
+                    if n > best_n:
+                        best_n = n
+                        best_lc = lc_piece
+                except Exception as piece_exc:
+                    LOG.warning("Skipping incompatible lightcurve piece %s during fallback: %s", idx, piece_exc)
+
+            if best_lc is None:
+                raise RuntimeError("Unable to build fallback lightcurve after stitch failure.") from stitch_exc
+            processed_lightcurves = best_lc
     else:
         processed_lightcurves = lightcurves
     # removing NaNs 

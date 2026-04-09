@@ -17,6 +17,7 @@
 # pydantic for request/response data validation and modeling
 
 import asyncio
+import os
 import json
 import logging
 import time as _time
@@ -53,7 +54,8 @@ logging.basicConfig(
 # the REQUEST_TIMEOUT_SECONDS is the max timeout time (None = no limit)
 # the DEFAULT_THRESHOLD is the score threshold for transit detection
 # the DEFAULT_K_CANDIDATES is the default number of top BLS candidates to consider
-DB_PATH = Path(__file__).resolve().parent / "stars_cache.db"
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent / "stars_cache.db"
+DB_PATH = Path(os.environ.get("COSMIKAI_DB_PATH", _DEFAULT_DB_PATH)).expanduser()
 REQUEST_TIMEOUT_SECONDS = None
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_K_CANDIDATES = 15
@@ -88,6 +90,15 @@ CREATE TABLE IF NOT EXISTS star_predictions (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     UNIQUE(target_name, mission, author, candidate_rank)
+);
+"""
+
+_CREATE_STAR_DETAILS_CACHE_SQL = """
+CREATE TABLE IF NOT EXISTS star_details_cache (
+    star_name     TEXT PRIMARY KEY,
+    payload_json  TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
 );
 """
 
@@ -164,6 +175,46 @@ async def _init_db() -> None:
     # creates the table if it doesn't exist
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(_CREATE_TABLE_SQL)
+        await db.execute(_CREATE_STAR_DETAILS_CACHE_SQL)
+        await db.commit()
+
+
+async def _get_cached_star_details(star_name: str) -> StarDetailsResponse | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT payload_json
+            FROM star_details_cache
+            WHERE star_name = ?
+            """,
+            (star_name,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row["payload_json"])
+        return StarDetailsResponse(**payload)
+    except Exception:
+        return None
+
+
+async def _upsert_star_details(star_name: str, details: StarDetailsResponse) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload_json = details.model_dump_json()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO star_details_cache (star_name, payload_json, fetched_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(star_name)
+            DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            (star_name, payload_json, now_iso, now_iso),
+        )
         await db.commit()
 
 # gets cached predictions for the same target/mission/author combination
@@ -320,7 +371,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -344,13 +395,23 @@ async def health() -> HealthResponse:
 
 
 @app.get("/api/star-details", response_model=StarDetailsResponse)
-async def star_details(star_name: str = QueryParam(..., min_length=1)) -> StarDetailsResponse:
+async def star_details(
+    star_name: str = QueryParam(..., min_length=1),
+    force_refresh: bool = QueryParam(default=False),
+) -> StarDetailsResponse:
     clean_name = star_name.strip()
     if not clean_name:
         raise HTTPException(status_code=400, detail="star_name is required.")
 
+    if not force_refresh:
+        cached = await _get_cached_star_details(clean_name)
+        if cached is not None:
+            return cached
+
     try:
-        return await asyncio.to_thread(fetch_star_details_from_mast, clean_name)
+        details = await asyncio.to_thread(fetch_star_details_from_mast, clean_name)
+        await _upsert_star_details(clean_name, details)
+        return details
     except StarDetailsFetchError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
 

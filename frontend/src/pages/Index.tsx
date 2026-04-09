@@ -1,12 +1,30 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { Terminal, ArrowRight, Activity, Radar, Satellite, Search, Loader2, Clock, Zap, Target, CheckCircle2, AlertTriangle } from "lucide-react";
+import {
+  ArrowRight,
+  Activity,
+  Radar,
+  Satellite,
+  Search,
+  Loader2,
+  Clock,
+  Zap,
+  Target,
+  CheckCircle2,
+  AlertTriangle,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   ResponsiveContainer,
   AreaChart,
@@ -88,8 +106,23 @@ const fallbackFluxSignalData = [
   { phase: 1, flux: 1.0013 },
 ];
 
+const API_BASE_STORAGE_KEY = "cosmikai_api_base_url";
+const TELEMETRY_REFRESH_MS = 30_000;
+const FLUX_PREVIEW_ROTATE_MS = 8_000;
+
+const normalizeApiBase = (value: string) => value.trim().replace(/\/+$/, "");
+
 const Index = () => {
   const navigate = useNavigate();
+  const isTelemetryFetchingRef = useRef(false);
+  const envApiBase = normalizeApiBase((import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:8000");
+  const [apiBaseUrl, setApiBaseUrl] = useState(() => {
+    if (typeof window === "undefined") return envApiBase;
+    const stored = window.localStorage.getItem(API_BASE_STORAGE_KEY);
+    return stored ? normalizeApiBase(stored) : envApiBase;
+  });
+  const [apiBaseDraft, setApiBaseDraft] = useState(apiBaseUrl);
+  const [apiBaseError, setApiBaseError] = useState<string | null>(null);
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [historyTotal, setHistoryTotal] = useState(0);
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -101,51 +134,85 @@ const Index = () => {
   const [isPredicting, setIsPredicting] = useState(false);
   const [predictionResult, setPredictionResult] = useState<PredictionResult | null>(null);
   const [predictionError, setPredictionError] = useState<string | null>(null);
+  const [fluxPreviewIndex, setFluxPreviewIndex] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
-    const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:8000";
+    let disposed = false;
 
-    const fetchTelemetry = async () => {
-      setLoading(true);
+    const fetchTelemetry = async (showLoading: boolean) => {
+      if (isTelemetryFetchingRef.current) return;
+      isTelemetryFetchingRef.current = true;
+      if (showLoading) setLoading(true);
+
       try {
         const [historyRes, healthRes, statsRes] = await Promise.allSettled([
-          fetch(`${apiBase}/api/history?limit=120&offset=0`, { signal: controller.signal }),
-          fetch(`${apiBase}/api/health`, { signal: controller.signal }),
-          fetch(`${apiBase}/api/stats`, { signal: controller.signal }),
+          fetch(`${apiBaseUrl}/api/history?limit=120&offset=0`, { signal: controller.signal }),
+          fetch(`${apiBaseUrl}/api/health`, { signal: controller.signal }),
+          fetch(`${apiBaseUrl}/api/stats`, { signal: controller.signal }),
         ]);
 
-        if (historyRes.status === "fulfilled" && historyRes.value.ok) {
+        if (!disposed && historyRes.status === "fulfilled" && historyRes.value.ok) {
           const historyJson = (await historyRes.value.json()) as HistoryResponse;
           setHistoryItems(historyJson.items ?? []);
           setHistoryTotal(historyJson.total ?? 0);
         }
 
-        if (healthRes.status === "fulfilled" && healthRes.value.ok) {
+        if (!disposed && healthRes.status === "fulfilled" && healthRes.value.ok) {
           const healthJson = (await healthRes.value.json()) as HealthResponse;
           setHealth(healthJson);
         }
 
-        if (statsRes.status === "fulfilled" && statsRes.value.ok) {
+        if (!disposed && statsRes.status === "fulfilled" && statsRes.value.ok) {
           const statsJson = (await statsRes.value.json()) as StatsResponse;
           setStatsData(statsJson);
         }
       } catch (err) {
         console.error("Homepage telemetry fetch failed:", err);
       } finally {
-        setLoading(false);
+        if (showLoading && !disposed) setLoading(false);
+        isTelemetryFetchingRef.current = false;
       }
     };
 
-    fetchTelemetry();
-    return () => controller.abort();
-  }, []);
+    void fetchTelemetry(true);
+    const intervalId = window.setInterval(() => {
+      void fetchTelemetry(false);
+    }, TELEMETRY_REFRESH_MS);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+      controller.abort();
+      isTelemetryFetchingRef.current = false;
+    };
+  }, [apiBaseUrl]);
+
+  const fluxPreviewCandidates = useMemo(
+    () => historyItems.filter((item) => Array.isArray(item.folded_lightcurve) && item.folded_lightcurve.length > 10),
+    [historyItems],
+  );
+
+  useEffect(() => {
+    if (fluxPreviewCandidates.length === 0) {
+      setFluxPreviewIndex(0);
+      return;
+    }
+    setFluxPreviewIndex((prev) => prev % fluxPreviewCandidates.length);
+  }, [fluxPreviewCandidates.length]);
+
+  useEffect(() => {
+    if (fluxPreviewCandidates.length <= 1) return;
+    const rotationId = window.setInterval(() => {
+      setFluxPreviewIndex((prev) => (prev + 1) % fluxPreviewCandidates.length);
+    }, FLUX_PREVIEW_ROTATE_MS);
+
+    return () => window.clearInterval(rotationId);
+  }, [fluxPreviewCandidates.length]);
 
   const fluxSignalData = useMemo(() => {
-    const source = historyItems.find((item) => Array.isArray(item.folded_lightcurve) && item.folded_lightcurve.length > 10);
-    if (!source?.folded_lightcurve) {
-      return fallbackFluxSignalData;
-    }
+    const source = fluxPreviewCandidates[fluxPreviewIndex];
+    if (!source?.folded_lightcurve) return fallbackFluxSignalData;
 
     const curve = source.folded_lightcurve;
     const stride = Math.max(1, Math.floor(curve.length / 120));
@@ -156,7 +223,12 @@ const Index = () => {
       phase: Number((idx / denom).toFixed(3)),
       flux: Number((Number(flux) || 0).toFixed(6)),
     }));
-  }, [historyItems]);
+  }, [fluxPreviewCandidates, fluxPreviewIndex]);
+
+  const fluxPreviewLabel =
+    fluxPreviewCandidates.length > 0
+      ? `${fluxPreviewCandidates[fluxPreviewIndex]?.star_name ?? "Unknown"} (${fluxPreviewIndex + 1}/${fluxPreviewCandidates.length})`
+      : "Synthetic sample";
 
   const chartYDomain = useMemo(() => {
     const values = fluxSignalData.map((point) => point.flux).filter((v) => Number.isFinite(v));
@@ -177,6 +249,8 @@ const Index = () => {
     [historyItems],
   );
 
+  const totalPredictionsLabel = (health?.total_predictions ?? historyTotal).toLocaleString();
+
   const statCards = [
     {
       icon: Activity,
@@ -195,30 +269,28 @@ const Index = () => {
     },
   ];
 
-  const totalPredictionsLabel = (health?.total_predictions ?? historyTotal).toLocaleString();
-
   const telemetryStats = [
     {
       label: "MODEL_ACCURACY",
-      value: health ? `${(health.model_auprc * 100).toFixed(1)}%` : "—",
+      value: health ? `${(health.model_auprc * 100).toFixed(1)}%` : "-",
       sub: "AUPRC",
       icon: Target,
     },
     {
       label: "PROCESSED_TARGETS",
-      value: statsData ? statsData.total_analyzed.toLocaleString() : "—",
+      value: statsData ? statsData.total_analyzed.toLocaleString() : "-",
       sub: "stars analysed",
       icon: Activity,
     },
     {
       label: "CANDIDATE_FLAGS",
-      value: statsData ? statsData.above_threshold.toLocaleString() : "—",
-      sub: `score ≥ ${threshold[0]}%`,
+      value: statsData ? statsData.above_threshold.toLocaleString() : "-",
+      sub: `score >= ${threshold[0]}%`,
       icon: CheckCircle2,
     },
     {
       label: "FALSE_POSITIVES",
-      value: statsData ? statsData.below_threshold.toLocaleString() : "—",
+      value: statsData ? statsData.below_threshold.toLocaleString() : "-",
       sub: `score < ${threshold[0]}%`,
       icon: AlertTriangle,
     },
@@ -227,12 +299,11 @@ const Index = () => {
   const handleQueryArchive = async () => {
     if (!starQuery.trim()) return;
 
-    const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:8000";
     setIsPredicting(true);
     setPredictionError(null);
 
     try {
-      const res = await fetch(`${apiBase}/api/predict`, {
+      const res = await fetch(`${apiBaseUrl}/api/predict`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -250,29 +321,6 @@ const Index = () => {
 
       const data = (await res.json()) as PredictionResult;
       setPredictionResult(data);
-
-      // Refresh dashboard telemetry after prediction.
-      const [historyRes, healthRes, statsRes] = await Promise.allSettled([
-        fetch(`${apiBase}/api/history?limit=120&offset=0`),
-        fetch(`${apiBase}/api/health`),
-        fetch(`${apiBase}/api/stats`),
-      ]);
-
-      if (historyRes.status === "fulfilled" && historyRes.value.ok) {
-        const historyJson = (await historyRes.value.json()) as HistoryResponse;
-        setHistoryItems(historyJson.items ?? []);
-        setHistoryTotal(historyJson.total ?? 0);
-      }
-
-      if (healthRes.status === "fulfilled" && healthRes.value.ok) {
-        const healthJson = (await healthRes.value.json()) as HealthResponse;
-        setHealth(healthJson);
-      }
-
-      if (statsRes.status === "fulfilled" && statsRes.value.ok) {
-        const statsJson = (await statsRes.value.json()) as StatsResponse;
-        setStatsData(statsJson);
-      }
     } catch (err) {
       if (err instanceof DOMException && err.name === "TimeoutError") {
         setPredictionError("Request timed out after 3 minutes. MAST may be slow, please try again.");
@@ -286,12 +334,39 @@ const Index = () => {
     }
   };
 
+  const handleApplyApiBase = () => {
+    const normalized = normalizeApiBase(apiBaseDraft);
+
+    if (!normalized) {
+      setApiBaseError("API address cannot be empty.");
+      return;
+    }
+
+    if (!/^https?:\/\//i.test(normalized)) {
+      setApiBaseError("API address must start with http:// or https://");
+      return;
+    }
+
+    setApiBaseError(null);
+    setApiBaseUrl(normalized);
+    setApiBaseDraft(normalized);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(API_BASE_STORAGE_KEY, normalized);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-background">
       <header className="border-b border-border px-6 py-4">
-        <div className="flex items-center gap-3">
-          <Terminal className="h-5 w-5 text-foreground" />
-          <span className="font-data text-sm font-semibold tracking-wide">COSMIK_AI</span>
+        <div className="flex items-center justify-between gap-3">
+          <span className="font-data text-sm font-semibold tracking-wide">CosmikAi</span>
+          <Button
+            type="button"
+            onClick={() => navigate("/visualizer")}
+            className="bg-emerald-400/90 text-slate-950 hover:bg-emerald-300 font-data text-xs uppercase tracking-wider px-4 rounded-md"
+          >
+            Open Visualizer
+          </Button>
         </div>
       </header>
 
@@ -301,23 +376,14 @@ const Index = () => {
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5 }}
-            className="grid gap-5 lg:grid-cols-[0.95fr_1.05fr]"
+            className="grid gap-5 lg:grid-cols-[0.95fr_1.05fr] lg:items-stretch"
           >
-            <div className="space-y-4">
+            <div className="space-y-4 lg:h-full lg:flex lg:flex-col">
               <p className="font-data text-[10px] text-muted-foreground uppercase tracking-widest mb-2">
                 Astrophysics Data Pipeline v2.4.1
               </p>
-              <h1 className="text-2xl md:text-[2rem] font-semibold leading-tight tracking-tight">
-                Stellar Transit Analysis
-              </h1>
-              <div className="max-w-3xl text-sm text-muted-foreground leading-relaxed space-y-3">
-                <p>
-                  Compact command center for loading missions, running inference, and inspecting candidate transit signals in real time.
-                </p>
-                <p className="text-xs">
-                  Missions: <span className="font-data text-foreground">Kepler</span>, <span className="font-data text-foreground">K2</span>, <span className="font-data text-foreground">TESS</span>.
-                </p>
-              </div>
+
+              <h1 className="text-2xl md:text-[2rem] font-semibold leading-tight tracking-tight">Stellar Transit Analysis</h1>
 
               <div className="flex flex-wrap gap-3">
                 <Button
@@ -330,7 +396,7 @@ const Index = () => {
                 <Button
                   variant="outline"
                   onClick={() => navigate("/visualizer")}
-                  className="border-border text-muted-foreground hover:text-foreground hover:bg-card font-data text-xs uppercase tracking-wider px-6 rounded-md"
+                  className="border-emerald-400/70 bg-emerald-400/10 text-emerald-200 hover:bg-emerald-400/20 hover:text-emerald-100 font-data text-xs uppercase tracking-wider px-6 rounded-md"
                 >
                   Open Visualizer
                 </Button>
@@ -420,9 +486,7 @@ const Index = () => {
                   )}
                 </Button>
 
-                {predictionError && (
-                  <p className="text-xs text-destructive">{predictionError}</p>
-                )}
+                {predictionError && <p className="text-xs text-destructive">{predictionError}</p>}
 
                 {predictionResult && (
                   <div className="rounded-md border border-border bg-card/40 p-3 space-y-3">
@@ -449,13 +513,108 @@ const Index = () => {
                   </div>
                 )}
               </div>
+
+              <div className="panel p-4 md:p-5 space-y-4 lg:flex-1">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Model & Server Overview</p>
+                  </div>
+                  <div className={`rounded-md border px-3 py-2 text-right ${health?.model_loaded ? "border-emerald-500/30 bg-emerald-500/10" : "border-rose-500/30 bg-rose-500/10"}`}>
+                    <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Status</p>
+                    <p className={`font-data text-sm ${health?.model_loaded ? "text-emerald-300" : "text-rose-300"}`}>
+                      {health ? (health.model_loaded ? "ONLINE" : "OFFLINE") : loading ? "CHECKING" : "UNKNOWN"}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  {[
+                    { label: "Model Version", value: health?.model_version ?? "-", sub: "deployed build" },
+                    { label: "AUPRC", value: health ? `${(health.model_auprc * 100).toFixed(2)}%` : "-", sub: "precision-recall quality" },
+                    { label: "Total Predictions", value: totalPredictionsLabel, sub: "archive volume" },
+                    { label: "Uptime", value: health ? `${Math.floor(health.uptime_seconds / 3600)}h ${Math.floor((health.uptime_seconds % 3600) / 60)}m` : "-", sub: "backend runtime" },
+                  ].map((item) => (
+                    <div key={item.label} className="rounded-md border border-border bg-card/40 p-3">
+                      <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground mb-1">{item.label}</p>
+                      <p className="font-data text-lg text-foreground leading-none">{item.value}</p>
+                      <p className="font-data text-[10px] text-muted-foreground mt-1">{item.sub}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-md border border-border bg-card/40 p-3">
+                    <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground mb-1">Threshold</p>
+                    <p className="font-data text-lg text-foreground">{threshold[0]}%</p>
+                    <p className="font-data text-[10px] text-muted-foreground mt-1">current decision cutoff</p>
+                  </div>
+                  <div className="rounded-md border border-border bg-card/40 p-3">
+                    <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground mb-1">Mission Coverage</p>
+                    <p className="font-data text-lg text-foreground">{uniqueMissionList.length > 0 ? uniqueMissionList.length : 3}</p>
+                    <p className="font-data text-[10px] text-muted-foreground mt-1">{uniqueMissionList.length > 0 ? uniqueMissionList.join(" / ") : "Kepler / K2 / TESS"}</p>
+                  </div>
+                </div>
+
+                <div className="rounded-md border border-border bg-background/50 p-3">
+                  <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Archived Breakdown</p>
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    {(statsData
+                      ? [
+                          { label: "Targets", value: statsData.total_analyzed.toLocaleString() },
+                          { label: "Flags", value: statsData.above_threshold.toLocaleString() },
+                          { label: "Rejected", value: statsData.below_threshold.toLocaleString() },
+                        ]
+                      : [
+                          { label: "Targets", value: historyTotal.toLocaleString() },
+                          { label: "Flags", value: detectionCount.toLocaleString() },
+                          { label: "Rejected", value: Math.max(0, historyItems.length - detectionCount).toLocaleString() },
+                        ]
+                    ).map((item) => (
+                      <div key={item.label} className="rounded-md border border-border/70 bg-card/40 p-2">
+                        <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">{item.label}</p>
+                        <p className="font-data text-sm text-foreground">{item.value}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="panel p-4 md:p-5 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">API Endpoint</p>
+                  <p className="font-data text-[10px] text-muted-foreground">runtime configurable</p>
+                </div>
+
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <Input
+                    value={apiBaseDraft}
+                    onChange={(e) => setApiBaseDraft(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleApplyApiBase()}
+                    placeholder="http://localhost:8000"
+                    className="bg-background border-border font-data text-sm"
+                  />
+                  <Button
+                    type="button"
+                    onClick={handleApplyApiBase}
+                    className="bg-foreground text-background hover:bg-foreground/90 font-data text-xs uppercase tracking-wider"
+                  >
+                    Apply
+                  </Button>
+                </div>
+
+                <p className="font-data text-[10px] text-muted-foreground">
+                  Active endpoint: <span className="text-foreground">{apiBaseUrl}</span>
+                </p>
+
+                {apiBaseError && <p className="text-xs text-destructive">{apiBaseError}</p>}
+              </div>
             </div>
 
-            <div className="space-y-5">
+            <div className="space-y-5 lg:h-full">
               <div className="panel p-4 md:p-5">
                 <div className="flex items-center justify-between mb-3">
                   <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Transit Signal Preview</p>
-                  <p className="font-data text-[10px] text-foreground">{loading ? "Syncing" : `${totalPredictionsLabel} Total Predictions`}</p>
+                  <p className="font-data text-[10px] text-foreground">{fluxPreviewLabel}</p>
                 </div>
 
                 <div className="h-56">
@@ -469,12 +628,7 @@ const Index = () => {
                       </defs>
                       <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.18)" />
                       <XAxis dataKey="phase" tick={{ fill: "rgba(148,163,184,0.85)", fontSize: 10 }} tickLine={false} axisLine={false} />
-                      <YAxis
-                        tick={{ fill: "rgba(148,163,184,0.85)", fontSize: 10 }}
-                        tickLine={false}
-                        axisLine={false}
-                        domain={chartYDomain}
-                      />
+                      <YAxis tick={{ fill: "rgba(148,163,184,0.85)", fontSize: 10 }} tickLine={false} axisLine={false} domain={chartYDomain} />
                       <Tooltip
                         contentStyle={{
                           backgroundColor: "rgba(2,6,23,0.95)",
@@ -594,11 +748,9 @@ const Index = () => {
 
       <footer className="border-t border-border px-2 py-3 md:px-4">
         <div className="mx-auto max-w-[1720px] flex items-center justify-between">
+          <p className="font-data text-xs text-muted-foreground">2026 CosmikAi</p>
           <p className="font-data text-xs text-muted-foreground">
-            © 2024 Cosmik AI Research
-          </p>
-          <p className="font-data text-xs text-muted-foreground">
-            Build: <span className="text-foreground">2024.03.15</span>
+            Build: <span className="text-foreground">2026.04.09</span>
           </p>
         </div>
       </footer>
