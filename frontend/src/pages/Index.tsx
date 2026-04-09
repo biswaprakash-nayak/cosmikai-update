@@ -86,6 +86,30 @@ interface PredictionResult {
   timestamp: string;
 }
 
+interface StarDetailsResult {
+  star_name: string;
+  source: string;
+  ra: number | null;
+  dec: number | null;
+  gaia_id: string | null;
+  tic_id: string | null;
+  teff: number | null;
+  radius: number | null;
+  mass: number | null;
+  logg: number | null;
+  distance: number | null;
+  vmag: number | null;
+  tmag: number | null;
+  found: boolean;
+}
+
+interface UploadInferenceResult {
+  prediction: PredictionResult;
+  star_details: StarDetailsResult;
+  source_file: string;
+  used_mast_details: boolean;
+}
+
 const MISSION_MAP: Record<string, string> = {
   kepler: "Kepler",
   k2: "K2",
@@ -134,6 +158,21 @@ const Index = () => {
   const [isPredicting, setIsPredicting] = useState(false);
   const [predictionResult, setPredictionResult] = useState<PredictionResult | null>(null);
   const [predictionError, setPredictionError] = useState<string | null>(null);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadName, setUploadName] = useState("");
+  const [uploadMission, setUploadMission] = useState("UPLOAD");
+  const [uploadUseMastDetails, setUploadUseMastDetails] = useState(false);
+  const [uploadRa, setUploadRa] = useState("");
+  const [uploadDec, setUploadDec] = useState("");
+  const [uploadTeff, setUploadTeff] = useState("");
+  const [uploadRadius, setUploadRadius] = useState("");
+  const [uploadMass, setUploadMass] = useState("");
+  const [uploadDistance, setUploadDistance] = useState("");
+  const [uploadGaiaId, setUploadGaiaId] = useState("");
+  const [uploadTicId, setUploadTicId] = useState("");
+  const [isUploadPredicting, setIsUploadPredicting] = useState(false);
+  const [uploadPredictionError, setUploadPredictionError] = useState<string | null>(null);
+  const [uploadResult, setUploadResult] = useState<UploadInferenceResult | null>(null);
   const [fluxPreviewIndex, setFluxPreviewIndex] = useState(0);
 
   useEffect(() => {
@@ -355,6 +394,68 @@ const Index = () => {
     }
   };
 
+  const handleUploadInference = async () => {
+    if (!uploadFile) {
+      setUploadPredictionError("Please choose a lightcurve file to upload.");
+      return;
+    }
+    if (!uploadName.trim()) {
+      setUploadPredictionError("Please enter a star name for this upload.");
+      return;
+    }
+
+    const appendIfFilled = (form: FormData, key: string, value: string) => {
+      const cleaned = value.trim();
+      if (cleaned) form.append(key, cleaned);
+    };
+
+    setIsUploadPredicting(true);
+    setUploadPredictionError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", uploadFile);
+      formData.append("name", uploadName.trim());
+      formData.append("mission", uploadMission.trim() || "UPLOAD");
+      formData.append("threshold", String(threshold[0] / 100));
+      formData.append("use_mast_details", uploadUseMastDetails ? "true" : "false");
+
+      appendIfFilled(formData, "ra", uploadRa);
+      appendIfFilled(formData, "dec", uploadDec);
+      appendIfFilled(formData, "teff", uploadTeff);
+      appendIfFilled(formData, "radius", uploadRadius);
+      appendIfFilled(formData, "mass", uploadMass);
+      appendIfFilled(formData, "distance", uploadDistance);
+      appendIfFilled(formData, "gaia_id", uploadGaiaId);
+      appendIfFilled(formData, "tic_id", uploadTicId);
+
+      const res = await fetch(`${apiBaseUrl}/api/predict-upload`, {
+        method: "POST",
+        body: formData,
+        signal: AbortSignal.timeout(195_000),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(err.detail ?? `Server error: ${res.status}`);
+      }
+
+      const data = (await res.json()) as UploadInferenceResult;
+      setUploadResult(data);
+      setPredictionResult(data.prediction);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "TimeoutError") {
+        setUploadPredictionError("Upload inference timed out after 3 minutes.");
+      } else if (err instanceof Error) {
+        setUploadPredictionError(err.message);
+      } else {
+        setUploadPredictionError("An unexpected upload error occurred.");
+      }
+    } finally {
+      setIsUploadPredicting(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-background">
       <header className="border-b border-border px-6 py-4">
@@ -510,6 +611,100 @@ const Index = () => {
                         <p className="font-data text-xs text-foreground">{predictionResult.processing_time_seconds.toFixed(1)} s</p>
                       </div>
                     </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="panel p-4 md:p-5 space-y-4">
+                <div>
+                  <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Upload Lightcurve</p>
+                  <p className="text-xs text-muted-foreground mt-1">Upload CSV/TXT and run file-based inference directly from the webpage.</p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Lightcurve File</Label>
+                  <Input
+                    type="file"
+                    accept=".csv,.txt,.dat"
+                    onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)}
+                    className="bg-background border-border font-data text-sm file:text-foreground"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <Label className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Name (required)</Label>
+                    <Input
+                      value={uploadName}
+                      onChange={(e) => setUploadName(e.target.value)}
+                      placeholder="e.g. Kepler-22"
+                      className="bg-background border-border font-data text-sm"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Mission</Label>
+                    <Input
+                      value={uploadMission}
+                      onChange={(e) => setUploadMission(e.target.value)}
+                      placeholder="UPLOAD"
+                      className="bg-background border-border font-data text-sm"
+                    />
+                  </div>
+                </div>
+
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={uploadUseMastDetails}
+                    onChange={(e) => setUploadUseMastDetails(e.target.checked)}
+                    className="h-3.5 w-3.5"
+                  />
+                  Try fetching star details from MAST for this name
+                </label>
+
+                <details className="rounded-md border border-border bg-card/40 p-3">
+                  <summary className="cursor-pointer font-data text-[10px] uppercase tracking-wider text-muted-foreground">
+                    Optional Manual Star Details
+                  </summary>
+                  <div className="grid gap-2 sm:grid-cols-2 mt-3">
+                    <Input value={uploadRa} onChange={(e) => setUploadRa(e.target.value)} placeholder="RA" className="bg-background border-border font-data text-sm" />
+                    <Input value={uploadDec} onChange={(e) => setUploadDec(e.target.value)} placeholder="DEC" className="bg-background border-border font-data text-sm" />
+                    <Input value={uploadTeff} onChange={(e) => setUploadTeff(e.target.value)} placeholder="Teff" className="bg-background border-border font-data text-sm" />
+                    <Input value={uploadRadius} onChange={(e) => setUploadRadius(e.target.value)} placeholder="Radius" className="bg-background border-border font-data text-sm" />
+                    <Input value={uploadMass} onChange={(e) => setUploadMass(e.target.value)} placeholder="Mass" className="bg-background border-border font-data text-sm" />
+                    <Input value={uploadDistance} onChange={(e) => setUploadDistance(e.target.value)} placeholder="Distance" className="bg-background border-border font-data text-sm" />
+                    <Input value={uploadGaiaId} onChange={(e) => setUploadGaiaId(e.target.value)} placeholder="Gaia ID" className="bg-background border-border font-data text-sm" />
+                    <Input value={uploadTicId} onChange={(e) => setUploadTicId(e.target.value)} placeholder="TIC ID" className="bg-background border-border font-data text-sm" />
+                  </div>
+                </details>
+
+                <Button
+                  type="button"
+                  onClick={handleUploadInference}
+                  disabled={isUploadPredicting}
+                  className="w-full bg-foreground text-background hover:bg-foreground/90 font-data text-xs uppercase tracking-wider"
+                >
+                  {isUploadPredicting ? (
+                    <>
+                      <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                      Upload Inference Running...
+                    </>
+                  ) : (
+                    "Run Upload Inference"
+                  )}
+                </Button>
+
+                {uploadPredictionError && <p className="text-xs text-destructive">{uploadPredictionError}</p>}
+
+                {uploadResult && (
+                  <div className="rounded-md border border-border bg-card/40 p-3 space-y-2">
+                    <p className="font-data text-[10px] uppercase tracking-wider text-muted-foreground">Upload Result</p>
+                    <p className="font-data text-xs text-foreground">
+                      File: {uploadResult.source_file} | Star: {uploadResult.prediction.star_name} | Verdict: {uploadResult.prediction.verdict.replace("_", " ")}
+                    </p>
+                    <p className="font-data text-xs text-muted-foreground">
+                      Details Source: {uploadResult.star_details.source} {uploadResult.used_mast_details ? "(MAST enabled)" : ""}
+                    </p>
                   </div>
                 )}
               </div>

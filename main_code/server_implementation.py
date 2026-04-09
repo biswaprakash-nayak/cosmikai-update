@@ -21,20 +21,33 @@ import os
 import json
 import logging
 import time as _time
+from dataclasses import asdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 import aiosqlite
+import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi import Query as QueryParam
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # internal imports
-from model_inference import DEFAULT_WEIGHTS_PATH, predict_star_transit, resolve_torch_device
+from model_inference import (
+    DEFAULT_WEIGHTS_PATH,
+    _compute_dynamic_cutoff,
+    _periods_are_related,
+    build_candidate_matrix,
+    load_trained_model,
+    predict_star_transit,
+    resolve_torch_device,
+    score_candidates,
+)
+from preprocessing import bls_topk
 from star_details_service import (
     StarDetailsFetchError,
     StarDetailsResponse,
@@ -56,6 +69,8 @@ logging.basicConfig(
 # the DEFAULT_K_CANDIDATES is the default number of top BLS candidates to consider
 _DEFAULT_DB_PATH = Path(__file__).resolve().parent / "stars_cache.db"
 DB_PATH = Path(os.environ.get("COSMIKAI_DB_PATH", _DEFAULT_DB_PATH)).expanduser()
+DEMO_TEST_DATA_DIR = Path(__file__).resolve().parent / "demo_test_data"
+UPLOAD_ALLOWED_EXTENSIONS = {".csv", ".txt", ".dat"}
 REQUEST_TIMEOUT_SECONDS = None
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_K_CANDIDATES = 15
@@ -168,15 +183,217 @@ class HealthResponse(BaseModel):
     total_predictions: int
     uptime_seconds: float
 
+
+class UploadInferenceResponse(BaseModel):
+    prediction: PredictionResponse
+    star_details: StarDetailsResponse
+    source_file: str
+    used_mast_details: bool
+
+
+def _default_star_details(star_name: str) -> StarDetailsResponse:
+    return StarDetailsResponse(
+        star_name=star_name,
+        source="DEFAULT",
+        found=False,
+    )
+
 # initializes the SQLite database and creates the necessary table if it doesn't exist
 async def _init_db() -> None:
     # ensures if the file exists
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DEMO_TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
     # creates the table if it doesn't exist
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(_CREATE_TABLE_SQL)
         await db.execute(_CREATE_STAR_DETAILS_CACHE_SQL)
         await db.commit()
+
+
+def _parse_uploaded_lightcurve(file_name: str, raw_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
+    suffix = Path(file_name).suffix.lower()
+    if suffix and suffix not in UPLOAD_ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(UPLOAD_ALLOWED_EXTENSIONS))
+        raise ValueError(f"Unsupported file extension '{suffix}'. Allowed: {allowed}")
+
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw_bytes.decode("latin-1")
+
+    for delimiter in [",", None]:
+        try:
+            data = np.genfromtxt(
+                text.splitlines(),
+                delimiter=delimiter,
+                names=True,
+                dtype=np.float64,
+                encoding="utf-8",
+            )
+            if getattr(data, "dtype", None) is not None and data.dtype.names:
+                cols = list(data.dtype.names)
+                lower = {c.lower(): c for c in cols}
+                time_col = lower.get("time") or next((c for c in cols if "time" in c.lower()), cols[0])
+                flux_col = lower.get("flux") or next((c for c in cols if "flux" in c.lower()), None)
+                if flux_col is None and len(cols) > 1:
+                    flux_col = cols[1]
+                if flux_col:
+                    time_arr = np.asarray(data[time_col], dtype=np.float64)
+                    flux_arr = np.asarray(data[flux_col], dtype=np.float64)
+                    break
+            else:
+                raise ValueError
+        except Exception:
+            time_arr = np.array([], dtype=np.float64)
+            flux_arr = np.array([], dtype=np.float64)
+    else:
+        for delimiter in [",", None]:
+            try:
+                matrix = np.genfromtxt(text.splitlines(), delimiter=delimiter, dtype=np.float64)
+                if matrix.ndim == 1:
+                    if matrix.size < 2:
+                        continue
+                    matrix = matrix.reshape(-1, 2)
+                if matrix.ndim == 2 and matrix.shape[1] >= 2:
+                    time_arr = np.asarray(matrix[:, 0], dtype=np.float64)
+                    flux_arr = np.asarray(matrix[:, 1], dtype=np.float64)
+                    break
+            except Exception:
+                continue
+        else:
+            raise ValueError("Could not parse uploaded file as a time/flux lightcurve.")
+
+    valid = np.isfinite(time_arr) & np.isfinite(flux_arr)
+    time_arr = time_arr[valid]
+    flux_arr = flux_arr[valid]
+    if time_arr.size < 64:
+        raise ValueError("Uploaded lightcurve must contain at least 64 valid rows.")
+
+    order = np.argsort(time_arr)
+    time_arr = time_arr[order]
+    flux_arr = flux_arr[order]
+
+    flux_med = float(np.nanmedian(flux_arr))
+    if np.isfinite(flux_med) and abs(flux_med) > 1e-12:
+        flux_arr = flux_arr / flux_med
+
+    return time_arr.astype(np.float32), flux_arr.astype(np.float32)
+
+
+def _run_pipeline_from_arrays(
+    *,
+    target_name: str,
+    mission: str,
+    threshold: float,
+    k_candidates: int,
+    cutoff_mode: str,
+    confidence_drop_fraction: float,
+    elbow_plus_extra: int,
+    time_arr: np.ndarray,
+    flux_arr: np.ndarray,
+) -> list[dict[str, Any]]:
+    model, resolved_device = load_trained_model(DEFAULT_WEIGHTS_PATH, device=None)
+    candidates = bls_topk(
+        time_arr,
+        flux_arr,
+        k=k_candidates,
+        use_gpu=resolved_device.type == "cuda",
+    )
+    X, folded_curves = build_candidate_matrix(
+        time_arr,
+        flux_arr,
+        candidates,
+        nbins=512,
+        use_gpu=resolved_device.type == "cuda",
+        device=resolved_device,
+    )
+    scores = score_candidates(model, X, resolved_device)
+
+    scored_candidates = list(enumerate(scores))
+    scored_candidates.sort(key=lambda x: x[1], reverse=True)
+
+    sorted_scores = [float(s) for _, s in scored_candidates]
+    dynamic_cutoff, _, elbow_idx = _compute_dynamic_cutoff(
+        sorted_scores=sorted_scores,
+        threshold=float(threshold),
+        cutoff_mode=cutoff_mode,
+        confidence_drop_fraction=float(confidence_drop_fraction),
+    )
+
+    results: list[dict[str, Any]] = []
+    max_detections = 5
+    picked_periods: list[float] = []
+    min_results_required = 1
+    if cutoff_mode.lower().strip() == "elbow" and elbow_idx is not None:
+        min_results_required = min(max_detections, max(1, (elbow_idx + 1) + max(0, int(elbow_plus_extra))))
+
+    for idx, score in scored_candidates:
+        candidate = candidates[idx]
+        if len(results) == 0:
+            folded = folded_curves[idx]
+            results.append(
+                {
+                    "target_name": target_name,
+                    "mission": mission,
+                    "threshold": float(threshold),
+                    "best_score": float(score),
+                    "verdict": "TRANSIT_DETECTED" if score >= threshold else "NO_TRANSIT",
+                    "best_candidate": asdict(candidate),
+                    "num_candidates": len(candidates),
+                    "device": str(resolved_device),
+                    "all_scores": [float(s) for s in scores],
+                    "folded_lightcurve": [float(x) for x in folded],
+                }
+            )
+            picked_periods.append(float(candidate.period))
+            if len(results) >= max_detections:
+                break
+            continue
+
+        if score < dynamic_cutoff and len(results) >= min_results_required:
+            break
+        if any(_periods_are_related(float(candidate.period), p) for p in picked_periods):
+            continue
+
+        folded = folded_curves[idx]
+        results.append(
+            {
+                "target_name": target_name,
+                "mission": mission,
+                "threshold": float(threshold),
+                "best_score": float(score),
+                "verdict": "TRANSIT_DETECTED",
+                "best_candidate": asdict(candidate),
+                "num_candidates": len(candidates),
+                "device": str(resolved_device),
+                "all_scores": [float(s) for s in scores],
+                "folded_lightcurve": [float(x) for x in folded],
+            }
+        )
+        picked_periods.append(float(candidate.period))
+        if len(results) >= max_detections:
+            break
+
+    if not results:
+        best_idx = int(np.argmax(scores))
+        best_candidate = candidates[best_idx]
+        best_folded = folded_curves[best_idx]
+        results = [
+            {
+                "target_name": target_name,
+                "mission": mission,
+                "threshold": float(threshold),
+                "best_score": float(scores[best_idx]),
+                "verdict": "NO_TRANSIT",
+                "best_candidate": asdict(best_candidate),
+                "num_candidates": len(candidates),
+                "device": str(resolved_device),
+                "all_scores": [float(s) for s in scores],
+                "folded_lightcurve": [float(x) for x in best_folded],
+            }
+        ]
+
+    return results
 
 
 async def _get_cached_star_details(star_name: str) -> StarDetailsResponse | None:
@@ -414,6 +631,150 @@ async def star_details(
         return details
     except StarDetailsFetchError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@app.post("/api/predict-upload", response_model=UploadInferenceResponse)
+async def predict_upload(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    mission: str = Form("UPLOAD"),
+    threshold: float = Form(DEFAULT_THRESHOLD),
+    k_candidates: int = Form(DEFAULT_K_CANDIDATES),
+    cutoff_mode: str = Form("relative"),
+    confidence_drop_fraction: float = Form(0.10),
+    elbow_plus_extra: int = Form(1),
+    use_mast_details: bool = Form(False),
+    ra: float | None = Form(None),
+    dec: float | None = Form(None),
+    gaia_id: str | None = Form(None),
+    tic_id: str | None = Form(None),
+    teff: float | None = Form(None),
+    radius: float | None = Form(None),
+    mass: float | None = Form(None),
+    logg: float | None = Form(None),
+    distance: float | None = Form(None),
+    vmag: float | None = Form(None),
+    tmag: float | None = Form(None),
+) -> UploadInferenceResponse:
+    target_name = name.strip()
+    mission_clean = mission.strip() or "UPLOAD"
+    if not target_name:
+        raise HTTPException(status_code=400, detail="name is required.")
+    if threshold < 0.0 or threshold > 1.0:
+        raise HTTPException(status_code=400, detail="threshold must be between 0 and 1.")
+    if k_candidates < 1 or k_candidates > 100:
+        raise HTTPException(status_code=400, detail="k_candidates must be between 1 and 100.")
+
+    file_name = file.filename or "uploaded_lightcurve.csv"
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        time_arr, flux_arr = _parse_uploaded_lightcurve(file_name, raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    t0 = _time.monotonic()
+    try:
+        results = await asyncio.to_thread(
+            _run_pipeline_from_arrays,
+            target_name=target_name,
+            mission=mission_clean,
+            threshold=threshold,
+            k_candidates=k_candidates,
+            cutoff_mode=cutoff_mode,
+            confidence_drop_fraction=confidence_drop_fraction,
+            elbow_plus_extra=elbow_plus_extra,
+            time_arr=time_arr,
+            flux_arr=flux_arr,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected server error: {exc}")
+
+    author = f"upload:{file_name}"
+    stored_batch = []
+    for result in results:
+        stored_batch.append(
+            {
+                "target_name": result["target_name"],
+                "mission": result["mission"],
+                "author": author,
+                "threshold": float(threshold),
+                "k_candidates": int(k_candidates),
+                "best_score": float(result["best_score"]),
+                "verdict": result["verdict"],
+                "best_candidate": result["best_candidate"],
+                "num_candidates": int(result["num_candidates"]),
+                "device": result["device"],
+                "all_scores": [float(s) for s in result["all_scores"]],
+                "folded_lightcurve": result.get("folded_lightcurve", []),
+            }
+        )
+    await _upsert_predictions_batch(stored_batch)
+
+    used_mast_details = False
+    details = _default_star_details(target_name)
+    if use_mast_details:
+        try:
+            details = await asyncio.to_thread(fetch_star_details_from_mast, target_name)
+            used_mast_details = True
+            await _upsert_star_details(target_name, details)
+        except StarDetailsFetchError:
+            details = _default_star_details(target_name)
+
+    manual_detail_payload = {
+        "ra": ra,
+        "dec": dec,
+        "gaia_id": gaia_id,
+        "tic_id": tic_id,
+        "teff": teff,
+        "radius": radius,
+        "mass": mass,
+        "logg": logg,
+        "distance": distance,
+        "vmag": vmag,
+        "tmag": tmag,
+    }
+    has_manual_details = any(value is not None for value in manual_detail_payload.values())
+    if has_manual_details:
+        merged = details.model_dump()
+        merged.update({k: v for k, v in manual_detail_payload.items() if v is not None})
+        merged["star_name"] = target_name
+        merged["source"] = "MANUAL" if not used_mast_details else "MAST+MANUAL"
+        merged["found"] = True
+        details = StarDetailsResponse(**merged)
+
+    best_result = results[0]
+    period_days = float(best_result["best_candidate"].get("period")) if best_result.get("best_candidate") else None
+    duration_estimate = float(best_result["best_candidate"].get("duration")) if best_result.get("best_candidate") else None
+    depth = float(best_result["best_candidate"].get("depth", 0.0)) if best_result.get("best_candidate") else 0.0
+    prediction = PredictionResponse(
+        star_name=best_result["target_name"],
+        mission=best_result["mission"],
+        score=float(best_result["best_score"]),
+        percentage=round(float(best_result["best_score"]) * 100.0, 2),
+        period_days=period_days,
+        verdict=best_result["verdict"],
+        transit_depth_estimate=abs(depth),
+        duration_estimate=duration_estimate,
+        num_datapoints=int(len(time_arr)),
+        cached=False,
+        processing_time_seconds=round(_time.monotonic() - t0, 3),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        folded_lightcurve=best_result.get("folded_lightcurve"),
+    )
+
+    return UploadInferenceResponse(
+        prediction=prediction,
+        star_details=details,
+        source_file=file_name,
+        used_mast_details=used_mast_details,
+    )
 
 # defines the /predict endpoint to run inference on the target
 # input:

@@ -12,3 +12,4 @@ fastapi                                # API framework for server_implementation
 uvicorn[standard]                      # ASGI server process
 aiosqlite                              # Async SQLite cache storage
 pydantic                               # Request/response validation models
+python-multipart                      # Multipart form/file upload parsing for FastAPI
